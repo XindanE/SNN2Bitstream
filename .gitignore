@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Datasets (downloaded by tools/download_data.py) and prepared test data
+data/
+test_data/
+
+# Generated artifacts
+ir_output/
+backend_projects/
+checkpoints/
+cache/
+xilinx/
+*.log
+
+# QAT-FT derives a companion config next to the one it was given
+configs/*_qat_ft.toml
+
+# Vivado / Vitis HLS scratch
+*.jou
+vivado*.backup.*
+.Xil/
+_x/
+
+# OS / editor
+.DS_Store
+*.swp
+.last_sw_project

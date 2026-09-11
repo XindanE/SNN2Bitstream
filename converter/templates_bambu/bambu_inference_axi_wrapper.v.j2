@@ -1,0 +1,423 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// AXI wrapper for the Bambu-generated SNN inference module.
+// Local BRAM buffers input/output data, giving the DUT the 1-cycle synchronous
+// memory response it assumes. PS writes input via AXI-Lite, starts inference,
+// then reads output regs; no AXI master needed since all DUT memory accesses are local.
+//
+// Interface: S_AXI_CONTROL is the AXI4-Lite slave (control regs + data BRAM); interrupt is active-high level when done.
+//
+// AXI-Lite address map (256KB, 18-bit):
+//   0x00000  Control  [W] bit0=ap_start pulse; [R] bit0=ap_start, bit1=ap_done, bit2=ap_idle
+//   0x10000  Input BRAM (float, 32-bit)
+//   0x30000  Output (float, 32-bit)
+//
+// DUT pointers: input=0x000000, output=0x100000 (internal BRAM is >=0x200000, no conflict).
+
+`timescale 1ns / 1ps
+
+module bambu_inference_axi_wrapper #(
+    parameter INPUT_WORDS  = {{ input_words }},   // TIMESTEPS * INPUT_DIM_FLAT
+    parameter OUTPUT_WORDS = {{ output_words }}       // OUTPUT_DIM
+) (
+    // Clock and Reset
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI_CONTROL, ASSOCIATED_RESET aresetn, FREQ_HZ 100000000" *)
+    input  wire        aclk,
+
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 aresetn RST" *)
+    (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
+    input  wire        aresetn,
+
+    // Interrupt
+    (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 interrupt INTERRUPT" *)
+    (* X_INTERFACE_PARAMETER = "SENSITIVITY LEVEL_HIGH" *)
+    output wire        interrupt,
+
+    // S_AXI_CONTROL (AXI4-Lite Slave)
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL AWADDR" *)
+    (* X_INTERFACE_PARAMETER = "PROTOCOL AXI4LITE, DATA_WIDTH 32, ADDR_WIDTH 18" *)
+    input  wire [17:0] s_axi_control_awaddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL AWVALID" *)
+    input  wire        s_axi_control_awvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL AWREADY" *)
+    output wire        s_axi_control_awready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL WDATA" *)
+    input  wire [31:0] s_axi_control_wdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL WSTRB" *)
+    input  wire [3:0]  s_axi_control_wstrb,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL WVALID" *)
+    input  wire        s_axi_control_wvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL WREADY" *)
+    output wire        s_axi_control_wready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL BRESP" *)
+    output wire [1:0]  s_axi_control_bresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL BVALID" *)
+    output wire        s_axi_control_bvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL BREADY" *)
+    input  wire        s_axi_control_bready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL ARADDR" *)
+    input  wire [17:0] s_axi_control_araddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL ARVALID" *)
+    input  wire        s_axi_control_arvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL ARREADY" *)
+    output wire        s_axi_control_arready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL RDATA" *)
+    output wire [31:0] s_axi_control_rdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL RRESP" *)
+    output wire [1:0]  s_axi_control_rresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL RVALID" *)
+    output wire        s_axi_control_rvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI_CONTROL RREADY" *)
+    input  wire        s_axi_control_rready
+);
+
+    // DUT pointer base addresses, must not overlap Bambu internal BRAM (>= 0x200000).
+    localparam [63:0] DUT_INPUT_BASE  = 64'h0000_0000;
+    localparam [63:0] DUT_OUTPUT_BASE = 64'h0010_0000;
+
+    // AP control
+    reg  ap_start;
+    reg  ap_done;
+    reg  ap_idle;
+    reg  bambu_start;      // 1-cycle pulse to DUT
+
+    // DUT interface
+    wire        bambu_done;
+    wire [1:0]  dut_oe_ram;
+    wire [1:0]  dut_we_ram;
+    wire [127:0] dut_addr_ram;   // 2 channels x 64-bit
+    wire [63:0] dut_wdata_ram;
+    wire [11:0] dut_data_ram_size;
+    reg  [63:0] dut_rdata;
+    reg  [1:0]  dut_datardy;
+
+    // Running flag: true while DUT is executing
+    wire running = ~ap_idle;
+
+    // Bambu uses active-low reset, same as AXI aresetn
+    wire bambu_reset = aresetn;
+
+    // Interrupt: level-high when done
+    assign interrupt = ap_done;
+
+    // Input BRAM, true dual-port (Vivado infers Block RAM).
+    // Port A: DUT CH0 read during inference, AXI slave write during idle.
+    // Port B: DUT CH1 read during inference, AXI slave read during idle.
+
+    (* ram_style = "block" *) reg [31:0] input_bram [0:INPUT_WORDS-1];
+
+    // Port A signals
+    wire [14:0] bram_addr_a;
+    wire        bram_we_a;
+    wire [31:0] bram_din_a;
+    reg  [31:0] bram_dout_a;
+
+    // Port B signals
+    wire [14:0] bram_addr_b;
+    reg  [31:0] bram_dout_b;
+
+    // Port A: read-first, write support
+    always @(posedge aclk) begin
+        if (bram_we_a)
+            input_bram[bram_addr_a] <= bram_din_a;
+        bram_dout_a <= input_bram[bram_addr_a];
+    end
+
+    // Port B: read only
+    always @(posedge aclk) begin
+        bram_dout_b <= input_bram[bram_addr_b];
+    end
+
+    // Output registers (flip-flops).
+    reg [31:0] output_regs [0:OUTPUT_WORDS-1];
+
+    // DUT memory interface. Both channels can read input_bram simultaneously.
+    // Address decode by bit 20: 0=input, 1=output. Response latency 1 cycle, matching BRAM and the Bambu FSM.
+
+    // Channel addresses (byte addresses from DUT)
+    wire [31:0] ch0_addr = dut_addr_ram[31:0];
+    wire [31:0] ch1_addr = dut_addr_ram[95:64];
+
+    // Address decode: input vs output
+    wire ch0_is_output = ch0_addr[20];
+    wire ch1_is_output = ch1_addr[20];
+
+    // Word indices for input BRAM
+    wire [14:0] ch0_input_idx = ch0_addr[16:2];
+    wire [14:0] ch1_input_idx = ch1_addr[16:2];
+
+    // Word indices for output regs
+    wire [3:0] ch0_output_idx = ch0_addr[5:2];
+    wire [3:0] ch1_output_idx = ch1_addr[5:2];
+
+    // BRAM port assignment
+    // AXI slave signals (defined below in AXI section)
+    wire        axi_bram_we;
+    wire [14:0] axi_bram_waddr;
+    wire [31:0] axi_bram_wdata;
+    wire [14:0] axi_bram_raddr;
+
+    // Port A MUX: DUT CH0 (during inference) or AXI slave (during idle)
+    assign bram_addr_a = running ? ch0_input_idx : (axi_bram_we ? axi_bram_waddr : axi_bram_raddr);
+    assign bram_we_a   = ~running & axi_bram_we;
+    assign bram_din_a  = axi_bram_wdata;
+
+    // Port B: DUT CH1 (always, only used during inference)
+    assign bram_addr_b = ch1_input_idx;
+
+    // Output register writes (single always block for both DUT and AXI)
+    // AXI write signals (defined in AXI section below, forward-declared here)
+    wire        wr_en;
+    wire        wr_is_output;
+    wire [3:0]  aw_output_idx;
+
+    always @(posedge aclk) begin
+        if (!aresetn) begin : output_reset
+            integer k;
+            for (k = 0; k < OUTPUT_WORDS; k = k + 1)
+                output_regs[k] <= 32'd0;
+        end else begin
+            // DUT writes (during inference)
+            if (dut_we_ram[0] && ch0_is_output)
+                output_regs[ch0_output_idx] <= dut_wdata_ram[31:0];
+            if (dut_we_ram[1] && ch1_is_output)
+                output_regs[ch1_output_idx] <= dut_wdata_ram[63:32];
+            // AXI slave writes (during idle, for test/debug)
+            if (wr_en && wr_is_output)
+                output_regs[aw_output_idx] <= s_axi_control_wdata;
+        end
+    end
+
+    // DUT read data (1-cycle registered)
+    // Register the address-decode flags for alignment with BRAM output
+    reg ch0_is_output_d, ch1_is_output_d;
+    reg [3:0] ch0_outrd_idx, ch1_outrd_idx;
+
+    always @(posedge aclk) begin
+        ch0_is_output_d <= ch0_is_output;
+        ch1_is_output_d <= ch1_is_output;
+        ch0_outrd_idx   <= ch0_output_idx;
+        ch1_outrd_idx   <= ch1_output_idx;
+    end
+
+    // Read data MUX: select between BRAM output and output regs
+    wire [31:0] ch0_rdata = ch0_is_output_d ? output_regs[ch0_outrd_idx] : bram_dout_a;
+    wire [31:0] ch1_rdata = ch1_is_output_d ? output_regs[ch1_outrd_idx] : bram_dout_b;
+
+    // M_DataRdy asserts 1 cycle after any memory access (registered, matching BRAM latency).
+    // Read data is combinational from the already-registered BRAM output to avoid double-registration (2-cycle latency).
+    reg [1:0] datardy_r;
+    always @(posedge aclk) begin
+        if (!aresetn)
+            datardy_r <= 2'b00;
+        else begin
+            datardy_r[0] <= dut_oe_ram[0] | dut_we_ram[0];
+            datardy_r[1] <= dut_oe_ram[1] | dut_we_ram[1];
+        end
+    end
+
+    // Read data is a combinational MUX of already-registered BRAM outputs, total latency 1 cycle.
+    always @(*) begin
+        dut_datardy = datardy_r;
+        dut_rdata   = {ch1_rdata, ch0_rdata};
+    end
+
+    // AXI4-Lite slave (S_AXI_CONTROL). Address map (18-bit, 256KB):
+    //   0x00000-0x0FFFF control registers (only 0x00 used)
+    //   0x10000-0x2FFFF input BRAM
+    //   0x30000-0x3FFFF output registers
+
+    // Region decode helpers
+    wire [17:0] aw_addr_w = s_axi_control_awaddr;
+    wire [17:0] ar_addr_w = s_axi_control_araddr;
+
+    // Write channel
+    reg        aw_ready_r;
+    reg        w_ready_r;
+    reg        bvalid_r;
+    reg [17:0] aw_addr_r;
+
+    assign s_axi_control_awready = aw_ready_r;
+    assign s_axi_control_wready  = w_ready_r;
+    assign s_axi_control_bresp   = 2'b00;  // OKAY
+    assign s_axi_control_bvalid  = bvalid_r;
+
+    // Accept AW and W together
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            aw_ready_r <= 1'b0;
+            w_ready_r  <= 1'b0;
+            aw_addr_r  <= 18'd0;
+        end else begin
+            if (!aw_ready_r && s_axi_control_awvalid && s_axi_control_wvalid) begin
+                aw_ready_r <= 1'b1;
+                w_ready_r  <= 1'b1;
+                aw_addr_r  <= s_axi_control_awaddr;
+            end else begin
+                aw_ready_r <= 1'b0;
+                w_ready_r  <= 1'b0;
+            end
+        end
+    end
+
+    // Write response
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            bvalid_r <= 1'b0;
+        end else begin
+            if (aw_ready_r && s_axi_control_awvalid &&
+                w_ready_r  && s_axi_control_wvalid && !bvalid_r)
+                bvalid_r <= 1'b1;
+            else if (bvalid_r && s_axi_control_bready)
+                bvalid_r <= 1'b0;
+        end
+    end
+
+    // Write enable pulse
+    assign wr_en = aw_ready_r && s_axi_control_awvalid &&
+                   w_ready_r  && s_axi_control_wvalid;
+
+    // Write address decode
+    wire wr_is_ctrl   = (aw_addr_r < 18'h10000);
+    wire wr_is_input  = (aw_addr_r >= 18'h10000) && (aw_addr_r < 18'h30000);
+    assign wr_is_output = (aw_addr_r >= 18'h30000);
+
+    // Input BRAM write address (word index)
+    wire [17:0] aw_input_offset = aw_addr_r - 18'h10000;
+    assign axi_bram_waddr = aw_input_offset[16:2];
+    assign axi_bram_wdata = s_axi_control_wdata;
+    assign axi_bram_we    = wr_en && wr_is_input;
+
+    // Output register AXI write index
+    assign aw_output_idx = aw_addr_r[5:2];
+
+    // Read channel
+    reg        ar_ready_r;
+    reg        rvalid_r;
+    reg [31:0] rdata_r;
+    reg [17:0] ar_addr_r;
+    reg        rd_pending;  // 1-cycle pipeline for BRAM read
+
+    assign s_axi_control_arready = ar_ready_r;
+    assign s_axi_control_rdata   = rdata_r;
+    assign s_axi_control_rresp   = 2'b00;  // OKAY
+    assign s_axi_control_rvalid  = rvalid_r;
+
+    // Read address decode
+    wire rd_is_ctrl   = (ar_addr_r < 18'h10000);
+    wire rd_is_input  = (ar_addr_r >= 18'h10000) && (ar_addr_r < 18'h30000);
+    wire rd_is_output = (ar_addr_r >= 18'h30000);
+
+    // Input BRAM read address for AXI (via Port A during idle)
+    wire [17:0] ar_input_offset = ar_addr_r - 18'h10000;
+    assign axi_bram_raddr = ar_input_offset[16:2];
+
+    // Output register read
+    wire [3:0] ar_output_idx = ar_addr_r[5:2];
+
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            ar_ready_r <= 1'b0;
+            rvalid_r   <= 1'b0;
+            rdata_r    <= 32'd0;
+            rd_pending <= 1'b0;
+            ar_addr_r  <= 18'd0;
+        end else begin
+            // Accept read address
+            if (!ar_ready_r && !rd_pending && !rvalid_r && s_axi_control_arvalid) begin
+                ar_ready_r <= 1'b1;
+                ar_addr_r  <= s_axi_control_araddr;
+                rd_pending <= 1'b1;
+            end else begin
+                ar_ready_r <= 1'b0;
+            end
+
+            // 1-cycle later: BRAM data ready, select and present data
+            if (rd_pending) begin
+                rd_pending <= 1'b0;
+                rvalid_r   <= 1'b1;
+                if (rd_is_ctrl)
+                    rdata_r <= {29'd0, ap_idle, ap_done, ap_start};
+                else if (rd_is_input)
+                    rdata_r <= bram_dout_a;  // from Port A (idle, so not conflicting with DUT)
+                else if (rd_is_output)
+                    rdata_r <= output_regs[ar_output_idx];
+                else
+                    rdata_r <= 32'd0;
+            end
+
+            // Complete read response
+            if (rvalid_r && s_axi_control_rready)
+                rvalid_r <= 1'b0;
+        end
+    end
+
+    // AP control logic (start / done / idle).
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            ap_start    <= 1'b0;
+            ap_done     <= 1'b0;
+            ap_idle     <= 1'b1;
+            bambu_start <= 1'b0;
+        end else begin
+            bambu_start <= 1'b0;  // default: 1-cycle pulse
+
+            // PS writes ap_start
+            if (wr_en && wr_is_ctrl && aw_addr_r[3:2] == 2'b00 && s_axi_control_wdata[0]) begin
+                if (ap_idle) begin
+                    ap_start    <= 1'b1;
+                    ap_done     <= 1'b0;
+                    ap_idle     <= 1'b0;
+                    bambu_start <= 1'b1;
+                end
+            end
+
+            // DUT signals completion
+            if (bambu_done) begin
+                ap_start <= 1'b0;
+                ap_done  <= 1'b1;
+                ap_idle  <= 1'b1;
+            end
+            // ap_done is cleared only on the next ap_start (above), not on read, to avoid a race where done clears before the read data reaches PS.
+        end
+    end
+
+    // Bambu DUT instantiation. Fixed pointers input=0, output=0x100000; all external memory accesses served by local BRAM/regs in 1 cycle.
+
+    {{ dut_module_name }} bambu_dut (
+        .clock              (aclk),
+        .reset              (bambu_reset),
+        .start_port         (bambu_start),
+        .done_port          (bambu_done),
+
+        // Function parameters (fixed base addresses)
+        .\input             (DUT_INPUT_BASE),
+        .\output            (DUT_OUTPUT_BASE),
+
+        // Bambu native memory interface
+        .Mout_oe_ram        (dut_oe_ram),
+        .Mout_we_ram        (dut_we_ram),
+        .Mout_addr_ram      (dut_addr_ram),
+        .Mout_Wdata_ram     (dut_wdata_ram),
+        .Mout_data_ram_size (dut_data_ram_size),
+        .M_Rdata_ram        (dut_rdata),
+        .M_DataRdy          (dut_datardy)
+    );
+
+endmodule

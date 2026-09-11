@@ -1,0 +1,161 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Fully Connected Layer {{ index }}
+#include "fc_layer{{ index }}.h"
+#include "weights{{ layer.pair_idx }}.h"
+#include "biases{{ layer.pair_idx }}.h"
+#include <stddef.h>
+#include <stdint.h>
+
+{% if quant_weight %}
+// INT8 quantized path. Weights are int8 stored as int32_t in [-128,127],
+// accumulator is int32_t (pure integer MAC, float only at dequant), output is dequantized float.
+typedef float data_t;
+typedef int32_t w_t;
+typedef int32_t acc_t;
+
+void fc_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}]
+) {
+    const float weight_scale = {{ quant_weight.scale }}f;
+    const float bias_scale = {{ quant_bias.scale }}f;
+    const int bias_zero_point = {{ quant_bias.zero_point }};
+
+{% if use_sparse %}
+    // Compressed spike index: pre-scan input to build a compact index of active spikes.
+    int spike_idx[{{ layer.prev_out_dim }}];
+    int num_nonzero = 0;
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+        if (in[i]) {
+            spike_idx[num_nonzero++] = i;
+        }
+    }
+
+{% if input_is_spike %}
+    // Spike input: acc += weight, no multiply (pure int32 add).
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        for (int s = 0; s < num_nonzero; s++) {
+            acc += (acc_t)weights{{ layer.pair_idx }}[o][spike_idx[s]];
+        }
+        float bias_dequant = (float)(biases{{ layer.pair_idx }}[o] - bias_zero_point) * bias_scale;
+        out[o] = (float)acc * weight_scale + bias_dequant;
+    }
+{% else %}
+    // Data input: quantize float input to int8, then int32 MAC.
+    int8_t in_q[{{ layer.prev_out_dim }}];
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+        // Round-to-nearest, input assumed ~[0, max_val].
+        int v = (int)(in[i] + 0.5f);
+        in_q[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    // Rebuild sparse index over quantized non-zero elements.
+    num_nonzero = 0;
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+        if (in_q[i]) {
+            spike_idx[num_nonzero++] = i;
+        }
+    }
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        for (int s = 0; s < num_nonzero; s++) {
+            acc += (acc_t)weights{{ layer.pair_idx }}[o][spike_idx[s]] * (acc_t)in_q[spike_idx[s]];
+        }
+        float bias_dequant = (float)(biases{{ layer.pair_idx }}[o] - bias_zero_point) * bias_scale;
+        out[o] = (float)acc * weight_scale + bias_dequant;
+    }
+{% endif %}
+
+{% else %}
+    // Dense path
+{% if input_is_spike %}
+    // Spike input: acc += weight, no multiply (pure int32 add).
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i++) {
+            if (in[i]) {
+                acc += (acc_t)weights{{ layer.pair_idx }}[o][i];
+            }
+        }
+        float bias_dequant = (float)(biases{{ layer.pair_idx }}[o] - bias_zero_point) * bias_scale;
+        out[o] = (float)acc * weight_scale + bias_dequant;
+    }
+{% else %}
+    // Data input: quantize float input to int8, then int32 MAC.
+    int8_t in_q[{{ layer.prev_out_dim }}];
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+        int v = (int)(in[i] + 0.5f);
+        in_q[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i++) {
+            acc += (acc_t)weights{{ layer.pair_idx }}[o][i] * (acc_t)in_q[i];
+        }
+        float bias_dequant = (float)(biases{{ layer.pair_idx }}[o] - bias_zero_point) * bias_scale;
+        out[o] = (float)acc * weight_scale + bias_dequant;
+    }
+{% endif %}
+{% endif %}
+}
+
+{% else %}
+// Float path
+typedef float data_t;
+typedef float w_t;
+typedef float acc_t;
+
+void fc_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}]
+) {
+{% if use_sparse %}
+    // Compressed spike index
+    int spike_idx[{{ layer.prev_out_dim }}];
+    int num_nonzero = 0;
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+        if (in[i]) {
+            spike_idx[num_nonzero++] = i;
+        }
+    }
+
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[o]));
+        for (int s = 0; s < num_nonzero; s++) {
+{% if input_is_spike %}
+            acc += (acc_t)(weights{{ layer.pair_idx }}[o][spike_idx[s]]);
+{% else %}
+            acc += (acc_t)(weights{{ layer.pair_idx }}[o][spike_idx[s]]) * (acc_t)in[spike_idx[s]];
+{% endif %}
+        }
+        out[o] = acc;
+    }
+
+{% else %}
+    // Dense path
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[o]));
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i++) {
+            acc += ((acc_t)(weights{{ layer.pair_idx }}[o][i])) * (acc_t)in[i];
+        }
+        out[o] = acc;
+    }
+{% endif %}
+}
+{% endif %}

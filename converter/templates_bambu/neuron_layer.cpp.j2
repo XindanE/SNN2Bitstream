@@ -1,0 +1,41 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// LIF neuron layer {{ index }} with delayed-subtract reset.
+#include "neuron_layer{{ index }}.h"
+#include <stddef.h>
+
+typedef float data_t;
+
+void neuron_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}],
+    data_t mem[{{ layer.out_dim }}],
+    data_t spk[{{ layer.out_dim }}],
+    data_t reset[{{ layer.out_dim }}],
+    data_t beta,
+    data_t v_th
+){
+    for (size_t i = 0; i < {{ layer.out_dim }}; ++i) {
+        data_t m = beta * mem[i] + in[i] - reset[i];
+        data_t s = (m >= v_th) ? ((data_t)1) : ((data_t)0);
+        spk[i]   = s;
+        out[i]   = s;
+        mem[i]   = m;
+        reset[i] = s * v_th;
+    }
+}

@@ -1,0 +1,99 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Depthwise Convolutional Layer {{ index }}
+#include "dw_conv_layer{{ index }}.h"
+#include "weights{{ layer.pair_idx }}.h"
+#include "biases{{ layer.pair_idx }}.h"
+#include <stddef.h>
+#include <stdint.h>
+
+{% if quant_weight %}
+// INT8 quantized path.
+typedef float data_t;
+typedef int32_t w_t;
+typedef int32_t acc_t;
+{% else %}
+typedef float data_t;
+typedef float w_t;
+typedef double acc_t;
+{% endif %}
+
+void dw_conv_layer{{ index }}(
+    data_t out[{{ layer.channels * layer.out_h * layer.out_w }}],
+    const data_t in[{{ layer.channels * layer.in_h * layer.in_w }}]
+) {
+{% if quant_weight %}
+    const float weight_scale = {{ quant_weight.scale }}f;
+    const float bias_scale = {{ quant_bias.scale }}f;
+    const int bias_zero_point = {{ quant_bias.zero_point }};
+{% endif %}
+
+    const int C  = {{ layer.channels }};
+    const int IH = {{ layer.in_h }};
+    const int IW = {{ layer.in_w }};
+    const int OH = {{ layer.out_h }};
+    const int OW = {{ layer.out_w }};
+    const int K  = {{ layer.kernel_size }};
+    const int S  = {{ layer.stride }};
+    const int P  = {{ layer.padding }};
+
+    for (int c = 0; c < C; c++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+{% if quant_weight %}
+                acc_t acc = 0;
+{% else %}
+                acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[c]));
+{% endif %}
+                for (int kh = 0; kh < K; kh++) {
+                    for (int kw = 0; kw < K; kw++) {
+                        int ih = oh * S - P + kh;
+                        int iw = ow * S - P + kw;
+                        if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                            int in_idx = c * IH * IW + ih * IW + iw;
+{% if quant_weight %}
+{% if input_is_spike %}
+                            if (in[in_idx]) {
+                                acc += (acc_t)weights{{ layer.pair_idx }}[c][kh][kw];
+                            }
+{% else %}
+                            acc += (acc_t)((float)weights{{ layer.pair_idx }}[c][kh][kw] * in[in_idx]);
+{% endif %}
+{% else %}
+{% if input_is_spike %}
+                            if (in[in_idx]) {
+                                acc += (acc_t)weights{{ layer.pair_idx }}[c][kh][kw];
+                            }
+{% else %}
+                            w_t weight_val = weights{{ layer.pair_idx }}[c][kh][kw];
+                            acc += (acc_t)weight_val * (acc_t)in[in_idx];
+{% endif %}
+{% endif %}
+                        }
+                    }
+                }
+{% if quant_weight %}
+                float bias_dequant = (float)(biases{{ layer.pair_idx }}[c] - bias_zero_point) * bias_scale;
+                out[c * OH * OW + oh * OW + ow] = (data_t)((float)acc * weight_scale) + bias_dequant;
+{% else %}
+                out[c * OH * OW + oh * OW + ow] = (data_t)acc;
+{% endif %}
+            }
+        }
+    }
+}

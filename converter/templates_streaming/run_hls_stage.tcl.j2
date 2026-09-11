@@ -1,0 +1,86 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+# Per-stage Vitis HLS synthesis for streaming stage {{ stage_idx }}. Auto-generated; DO NOT EDIT.
+# {{ description }} (role: {{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }})
+
+set proj_name  stage{{ stage_idx }}_hls
+set root_dir   [file normalize [file dirname [info script]]]
+set src_dir    $root_dir
+set top_name   stage{{ stage_idx }}
+# ZCU104 default; override via FPGA_PART to match the Vivado part.
+set part_name  [expr {[info exists ::env(FPGA_PART)] && $::env(FPGA_PART) ne "" ? $::env(FPGA_PART) : "xczu7ev-ffvc1156-2-e"}]
+set ip_out_dir [file normalize "$root_dir/ip_export"]
+
+puts "HLS Stage {{ stage_idx }} ({{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }})"
+puts "root_dir   = $root_dir"
+puts "top_name   = $top_name"
+puts "ip_out_dir = $ip_out_dir"
+
+# Create project
+open_project -reset $proj_name
+set_top $top_name
+
+# Add all source files in this stage directory
+set src_files [glob -nocomplain -directory $src_dir *.{c,cpp,cc,C,h,hpp}]
+if {[llength $src_files] == 0} {
+    puts "\[Error\] No source files found in $src_dir"
+    exit 1
+}
+puts "Adding source files:"
+puts $src_files
+add_files $src_files
+
+# Solution: ZCU104 @ 100 MHz
+open_solution -reset solution1
+set_part $part_name
+create_clock -period 10 -name default
+{% if mul_impl_fabric %}
+# Force multiplies to LUT fabric instead of DSP48 (opt-in; safe only for models whose
+# multiplies are cheap address arithmetic, e.g. binary-input FCN. Blows up LUT on conv.)
+config_op mul -impl fabric
+{% endif %}
+
+# Run C synthesis
+csynth_design
+
+# Export IP for Vivado integration
+config_export -format ip_catalog -rtl verilog
+file mkdir $ip_out_dir
+
+# Remove stale IP before export
+set stale_ip [file normalize "$ip_out_dir/${top_name}_ip"]
+if {[file exists $stale_ip]} {
+    file delete -force $stale_ip
+}
+
+export_design -format ip_catalog -rtl verilog -output $ip_out_dir
+
+# Extract exported zip
+set export_zip "$ip_out_dir/export.zip"
+if {[file exists $export_zip]} {
+    set ip_extract_dir "$ip_out_dir/${top_name}_ip"
+    file mkdir $ip_extract_dir
+    puts "Extracting $export_zip to $ip_extract_dir"
+    exec unzip -o $export_zip -d $ip_extract_dir
+}
+
+puts "Stage {{ stage_idx }} HLS completed."
+puts "     Report: $root_dir/$proj_name/solution1/syn/report/${top_name}_csynth.rpt"
+puts "     IP:     $ip_out_dir"
+
+exit

@@ -1,0 +1,50 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#ifndef FC_LAYER{{ index }}_H
+#define FC_LAYER{{ index }}_H
+
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_ufixed<16, 1, AP_TRN, AP_SAT> data_narrow_t;
+typedef ap_uint<1> spike_t;
+#else
+#include <stdint.h>
+typedef float data_t;
+typedef float data_narrow_t;
+typedef uint8_t spike_t;
+#endif
+{% else %}
+typedef float data_t;
+typedef float data_narrow_t;
+{% endif %}
+
+void fc_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+{% if use_fixed and input_is_spike %}
+    const spike_t in[{{ layer.prev_out_dim }}]
+{% elif use_fixed and layer.input_is_narrow_data is defined and layer.input_is_narrow_data %}
+    const data_narrow_t in[{{ layer.prev_out_dim }}]
+{% else %}
+    const data_t in[{{ layer.prev_out_dim }}]
+{% endif %}
+);
+
+#endif // FC_LAYER{{ index }}_H

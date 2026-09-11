@@ -1,0 +1,29 @@
+[project]
+name = "mnist_fcn_rate_t10_h128"
+
+[dataset]
+kind = "MNIST"
+path = "data"
+
+[model_template]
+kind = "FCN"
+params.hidden = [128]
+params.timesteps = 10
+params.beta = 0.9
+params.encoding = "rate"
+
+[optimizer]
+kind = "Adam"
+lr = 0.001
+weight_decay = 0.0001
+
+[training]
+epochs = 15
+batch_size = 128
+
+# Zero-DSP design: add --mul-impl-fabric on the command line to map the remaining multiplies to LUTs
+[codegen]
+config = "SPQ"
+sparse = true
+bit_shift_beta = true   # leak as mem - (mem >> k); beta = 0.9 snaps to 1 - 2^-3
+data_width = 16         # data_t = ap_fixed<16,8> instead of the default 32-bit upgrade

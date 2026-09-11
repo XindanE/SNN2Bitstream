@@ -1,0 +1,237 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+# Vivado block design for the {{ num_stages }}-stage streaming pipeline on ZCU104 at 100 MHz. Auto-generated; DO NOT EDIT.
+# Dataflow: PS DDR feeds stage 0, stages connect through AXI-Stream FIFOs, and the last stage writes back to PS DDR.
+
+set root_dir   [file normalize [pwd]]
+
+if {$argc > 0} {
+    set user_proj_name [lindex $argv 0]
+} elseif {[info exists ::env(PROJECT_NAME)]} {
+    set user_proj_name $::env(PROJECT_NAME)
+} else {
+    set user_proj_name "streaming"
+}
+
+set proj_name  "${user_proj_name}_streaming_zcu104"
+set proj_dir   [file normalize "$root_dir/vivado_${proj_name}"]
+
+set bd_name    design_1
+set ps_name    zynq_ultra_ps_e_0
+set gpio_name  axi_gpio_0
+set part_name   [expr {[info exists ::env(FPGA_PART)]  && $::env(FPGA_PART)  ne "" ? $::env(FPGA_PART)  : "xczu7ev-ffvc1156-2-e"}]
+# board match string for get_board_parts; override BOARD_MATCH to target another board.
+set board_match [expr {[info exists ::env(BOARD_MATCH)] && $::env(BOARD_MATCH) ne "" ? $::env(BOARD_MATCH) : "*zcu104*"}]
+
+# Newer Vivado does not bundle ZCU104 board files; BOARD_REPO_PATHS points Vivado at installed board files. board_part is resolved after project creation so the script stays version-agnostic.
+if {[info exists ::env(BOARD_REPO_PATHS)] && $::env(BOARD_REPO_PATHS) ne ""} {
+    set_param board.repoPaths $::env(BOARD_REPO_PATHS)
+}
+
+puts "Streaming Vivado Build"
+puts "proj_name  = $proj_name"
+puts "proj_dir   = $proj_dir"
+puts "num_stages = {{ num_stages }}"
+
+# Step 1: Setup IP repositories (one per stage)
+set ip_repos [list]
+{% for sidx in range(num_stages) %}
+set stage{{ sidx }}_ip_dir [file normalize "$root_dir/stage{{ sidx }}/ip_export/stage{{ sidx }}_ip"]
+if {![file exists $stage{{ sidx }}_ip_dir]} {
+    puts "[Error] Stage {{ sidx }} IP not found: $stage{{ sidx }}_ip_dir"
+    exit 1
+}
+lappend ip_repos $stage{{ sidx }}_ip_dir
+puts "Stage {{ sidx }} IP: $stage{{ sidx }}_ip_dir"
+{% endfor %}
+
+# Step 2: Create Vivado project
+create_project -force $proj_name $proj_dir -part $part_name
+
+set board_part [lindex [get_board_parts -quiet $board_match] 0]
+if {$board_part ne ""} {
+    set_property board_part $board_part [current_project]
+    puts "===> Using board_part $board_part"
+} else {
+    puts "WARNING: no ZCU104 board part found; only device part set. Set BOARD_REPO_PATHS to your zcu104 board files."
+}
+
+set_property ip_repo_paths $ip_repos [current_project]
+update_ip_catalog
+
+# Step 3: Create Block Design
+create_bd_design $bd_name
+
+# 3.1 Zynq PS (IP version resolved from catalog for portability)
+set ps_vlnv [lindex [lsort -dictionary [get_ipdefs -all -filter {NAME == zynq_ultra_ps_e}]] end]
+create_bd_cell -type ip -vlnv $ps_vlnv $ps_name
+apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
+    -config {apply_board_preset "1"} \
+    [get_bd_cells $ps_name]
+set_property -dict [list \
+    CONFIG.SUBPRESET1            {DDR4_MICRON_MT40A256M16GE_083E} \
+    CONFIG.PSU__USE__S_AXI_GP0   {1} \
+] [get_bd_cells $ps_name]
+
+# 3.2 AXI GPIO (LEDs; IP version resolved from catalog)
+set gpio_vlnv [lindex [lsort -dictionary [get_ipdefs -all -filter {NAME == axi_gpio}]] end]
+create_bd_cell -type ip -vlnv $gpio_vlnv $gpio_name
+set_property -dict [list \
+    CONFIG.C_GPIO_WIDTH         {4} \
+    CONFIG.GPIO_BOARD_INTERFACE {led_4bits} \
+    CONFIG.C_ALL_OUTPUTS        {1} \
+] [get_bd_cells $gpio_name]
+
+# 3.3 Add stage IPs
+{% for sidx in range(num_stages) %}
+create_bd_cell -type ip -vlnv xilinx.com:hls:stage{{ sidx }}:1.0 stage{{ sidx }}_0
+{% endfor %}
+
+# 3.4 Add AXI-Stream FIFOs between stages (IP version resolved from catalog)
+set fifo_vlnv [lindex [lsort -dictionary [get_ipdefs -all -filter {NAME == axis_data_fifo}]] end]
+{% for fidx in range(num_stages - 1) %}
+create_bd_cell -type ip -vlnv $fifo_vlnv fifo_{{ fidx }}_{{ fidx + 1 }}
+set fifo_depth_{{ fidx }} {{ fifo_depths[fidx] }}
+set_property -dict [list \
+    CONFIG.TDATA_NUM_BYTES {4} \
+    CONFIG.FIFO_DEPTH      $fifo_depth_{{ fidx }} \
+    CONFIG.HAS_TKEEP       {1} \
+    CONFIG.HAS_TSTRB       {1} \
+    CONFIG.HAS_TLAST       {1} \
+] [get_bd_cells fifo_{{ fidx }}_{{ fidx + 1 }}]
+{% endfor %}
+
+# Step 4: Connections
+
+# 4.1 GPIO board interface
+apply_bd_automation -rule xilinx.com:bd_rule:board \
+    -config { Board_Interface {led_4bits ( LED ) } Manual_Source {Auto} } \
+    [get_bd_intf_pins axi_gpio_0/GPIO]
+
+# 4.2 GPIO AXI control
+apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
+    Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
+    Master {/zynq_ultra_ps_e_0/M_AXI_HPM0_FPD} \
+    Slave {/axi_gpio_0/S_AXI} \
+    ddr_seg {Auto} intc_ip {New AXI Interconnect} master_apm {0} \
+} [get_bd_intf_pins axi_gpio_0/S_AXI]
+
+# 4.3 Stage control ports (AXI-Lite from PS)
+{% for sidx in range(num_stages) %}
+apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
+    Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
+    Master {/zynq_ultra_ps_e_0/M_AXI_HPM0_FPD} \
+    Slave {/stage{{ sidx }}_0/s_axi_control} \
+    ddr_seg {Auto} intc_ip {New AXI Interconnect} master_apm {0} \
+} [get_bd_intf_pins stage{{ sidx }}_0/s_axi_control]
+{% endfor %}
+
+# 4.4 Stage DDR access (m_axi_gmem -> PS S_AXI_HPC0_FPD)
+{% for sidx in range(num_stages) %}
+{% if stage_has_gmem[sidx] %}
+{% if sidx == 0 %}
+apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
+    Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
+    Master {/stage{{ sidx }}_0/m_axi_gmem} \
+    Slave {/zynq_ultra_ps_e_0/S_AXI_HPC0_FPD} \
+    ddr_seg {Auto} intc_ip {New AXI SmartConnect} master_apm {0} \
+} [get_bd_intf_pins zynq_ultra_ps_e_0/S_AXI_HPC0_FPD]
+{% else %}
+apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
+    Clk_master {/zynq_ultra_ps_e_0/pl_clk0 (100 MHz)} \
+    Clk_slave  {/zynq_ultra_ps_e_0/pl_clk0 (100 MHz)} \
+    Clk_xbar   {/zynq_ultra_ps_e_0/pl_clk0 (100 MHz)} \
+    Master {/stage{{ sidx }}_0/m_axi_gmem} \
+    Slave {/zynq_ultra_ps_e_0/S_AXI_HPC0_FPD} \
+    ddr_seg {Auto} intc_ip {/axi_smc} master_apm {0} \
+} [get_bd_intf_pins stage{{ sidx }}_0/m_axi_gmem]
+{% endif %}
+{% endif %}
+{% endfor %}
+
+# 4.5 AXI-Stream: stage -> FIFO -> stage
+{% for fidx in range(num_stages - 1) %}
+connect_bd_intf_net \
+    [get_bd_intf_pins stage{{ fidx }}_0/out_stream] \
+    [get_bd_intf_pins fifo_{{ fidx }}_{{ fidx + 1 }}/S_AXIS]
+connect_bd_intf_net \
+    [get_bd_intf_pins fifo_{{ fidx }}_{{ fidx + 1 }}/M_AXIS] \
+    [get_bd_intf_pins stage{{ fidx + 1 }}_0/in_stream]
+{% endfor %}
+
+# 4.6 Clock and reset for FIFOs
+{% for fidx in range(num_stages - 1) %}
+connect_bd_net [get_bd_pins $ps_name/pl_clk0]    [get_bd_pins fifo_{{ fidx }}_{{ fidx + 1 }}/s_axis_aclk]
+connect_bd_net [get_bd_pins $ps_name/pl_resetn0]  [get_bd_pins fifo_{{ fidx }}_{{ fidx + 1 }}/s_axis_aresetn]
+{% endfor %}
+
+# 4.7 Clock and reset for stage IPs (if not already connected)
+{% for sidx in range(num_stages) %}
+if {[llength [get_bd_nets -of_objects [get_bd_pins stage{{ sidx }}_0/ap_clk]]] == 0} {
+    connect_bd_net [get_bd_pins $ps_name/pl_clk0]    [get_bd_pins stage{{ sidx }}_0/ap_clk]
+}
+if {[llength [get_bd_nets -of_objects [get_bd_pins stage{{ sidx }}_0/ap_rst_n]]] == 0} {
+    connect_bd_net [get_bd_pins $ps_name/pl_resetn0]  [get_bd_pins stage{{ sidx }}_0/ap_rst_n]
+}
+{% endfor %}
+
+# 4.8 Connect M_AXI_HPM1_FPD clock (auto-enabled by GPIO automation)
+if {[llength [get_bd_pins $ps_name/maxihpm1_fpd_aclk]]} {
+    set hpm1_nets [get_bd_nets -of_objects [get_bd_pins $ps_name/maxihpm1_fpd_aclk]]
+    if {[llength $hpm1_nets] == 0} {
+        connect_bd_net [get_bd_pins $ps_name/pl_clk0] [get_bd_pins $ps_name/maxihpm1_fpd_aclk]
+    }
+}
+
+regenerate_bd_layout
+
+# Step 5: Validate and save
+validate_bd_design
+save_bd_design
+
+# Step 6: HDL wrapper
+set bd_file [get_files "$proj_dir/$proj_name.srcs/sources_1/bd/$bd_name/$bd_name.bd"]
+make_wrapper -files $bd_file -top
+set wrapper_file "$proj_dir/$proj_name.srcs/sources_1/bd/$bd_name/hdl/${bd_name}_wrapper.v"
+add_files -norecurse $wrapper_file
+set_property top ${bd_name}_wrapper [current_fileset]
+update_compile_order -fileset sources_1
+
+# Step 7: Synthesis + Implementation + Bitstream
+# Parallelize per-stage OOC synthesis but cap at 4 jobs: each run holds a full synth in RAM and memory is the limit on a ~32GB machine. Drop the cap to 2 if a large (6+ stage) design OOMs.
+if {[catch {exec nproc} n_cpu] || ![string is integer -strict $n_cpu]} {
+    set n_cpu 4
+}
+set n_jobs [expr {$n_cpu < 4 ? $n_cpu : 4}]
+
+launch_runs synth_1 -jobs $n_jobs
+wait_on_run synth_1
+
+launch_runs impl_1 -to_step write_bitstream -jobs $n_jobs
+wait_on_run impl_1
+
+# Step 8: Export XSA
+set xsa_file "$proj_dir/${user_proj_name}_streaming_zcu104.xsa"
+write_hw_platform -fixed -force -include_bit -file $xsa_file
+
+puts "Streaming Vivado build completed."
+puts "     Project:   $proj_dir"
+puts "     Bitstream: $proj_dir/$proj_name.runs/impl_1/${bd_name}_wrapper.bit"
+puts "     XSA:       $xsa_file"
+
+exit

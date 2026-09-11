@@ -1,0 +1,478 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Streaming stage {{ stage_idx }} HLS top function. Auto-generated; DO NOT EDIT.
+// {{ description }} (role: {{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }}, in {{ in_dim }}, out {{ out_dim }}, {{ timesteps }} timesteps).
+#include "stage{{ stage_idx }}_top.h"
+#include "reset_node.h"
+{% for h in stage_layer_headers %}
+#include "{{ h }}"
+{% endfor %}
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) && !defined(__SYNTHESIS__)
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#endif
+
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+// Narrow type for AvgPool-of-spike output, bounded in [0,1].
+typedef ap_ufixed<16, 1, AP_TRN, AP_SAT> data_narrow_t;
+{% if lif_mem_narrow %}
+// Tighter per-stage LIF mem type chosen from the profiled bound.
+typedef ap_fixed<{{ lif_mem_width }}, {{ lif_mem_int }}, AP_TRN, AP_SAT> lif_mem_t;
+{% else %}
+typedef data_t lif_mem_t;
+{% endif %}
+typedef ap_uint<1> spike_t;
+typedef {{ input_hls_type }} input_t;
+typedef {{ output_hls_type }} output_t;
+typedef {{ acc_hls_type }} spike_acc_t;
+#else
+typedef float data_t;
+typedef float data_narrow_t;
+typedef float lif_mem_t;
+typedef uint8_t spike_t;
+typedef {{ input_gcc_type }} input_t;
+typedef {{ output_gcc_type }} output_t;
+typedef {{ acc_gcc_type }} spike_acc_t;
+#endif
+{% else %}
+typedef float data_t;
+typedef float data_narrow_t;
+typedef float lif_mem_t;
+typedef float input_t;
+typedef float output_t;
+typedef float spike_acc_t;
+{% endif %}
+
+// Stream pack/unpack helpers
+{% if use_fixed %}
+static inline void stream_write_spike(hls::stream<stream_pkt_t> &s, spike_t val, bool last) {
+#pragma HLS INLINE
+    stream_pkt_t pkt;
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    pkt.data = (ap_uint<32>)val;
+    pkt.keep = -1;
+    pkt.strb = -1;
+#else
+    pkt.data = (uint32_t)val;
+    pkt.keep = 0xFF;
+    pkt.strb = 0xFF;
+#endif
+    pkt.last = last ? 1 : 0;
+    s.write(pkt);
+}
+
+static inline spike_t stream_read_spike(hls::stream<stream_pkt_t> &s) {
+#pragma HLS INLINE
+    stream_pkt_t pkt = s.read();
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    return (spike_t)pkt.data[0];
+#else
+    return (spike_t)(pkt.data & 1);
+#endif
+}
+
+static inline void stream_write_data(hls::stream<stream_pkt_t> &s, data_t val, bool last) {
+#pragma HLS INLINE
+    stream_pkt_t pkt;
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    ap_uint<{{ fixed_config.width }}> raw;
+    raw.range({{ fixed_config.width - 1 }}, 0) = val.range({{ fixed_config.width - 1 }}, 0);
+    pkt.data = (ap_uint<32>)raw;
+    pkt.keep = -1;
+    pkt.strb = -1;
+#else
+    union { float f; uint32_t u; } conv;
+    conv.f = (float)val;
+    pkt.data = conv.u;
+    pkt.keep = 0xFF;
+    pkt.strb = 0xFF;
+#endif
+    pkt.last = last ? 1 : 0;
+    s.write(pkt);
+}
+
+static inline data_t stream_read_data(hls::stream<stream_pkt_t> &s) {
+#pragma HLS INLINE
+    stream_pkt_t pkt = s.read();
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    data_t val;
+    val.range({{ fixed_config.width - 1 }}, 0) = pkt.data.range({{ fixed_config.width - 1 }}, 0);
+    return val;
+#else
+    union { uint32_t u; float f; } conv;
+    conv.u = pkt.data;
+    return (data_t)conv.f;
+#endif
+}
+
+// 16-bit narrow-data stream helpers for the AvgPool to FC path.
+static inline void stream_write_narrow(hls::stream<stream_pkt_t> &s, data_narrow_t val, bool last) {
+#pragma HLS INLINE
+    stream_pkt_t pkt;
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    ap_uint<16> raw;
+    raw.range(15, 0) = val.range(15, 0);
+    pkt.data = (ap_uint<32>)raw;
+    pkt.keep = -1;
+    pkt.strb = -1;
+#else
+    union { float f; uint32_t u; } conv;
+    conv.f = (float)val;
+    pkt.data = conv.u;
+    pkt.keep = 0xFF;
+    pkt.strb = 0xFF;
+#endif
+    pkt.last = last ? 1 : 0;
+    s.write(pkt);
+}
+
+static inline data_narrow_t stream_read_narrow(hls::stream<stream_pkt_t> &s) {
+#pragma HLS INLINE
+    stream_pkt_t pkt = s.read();
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+    data_narrow_t val;
+    val.range(15, 0) = pkt.data.range(15, 0);
+    return val;
+#else
+    union { uint32_t u; float f; } conv;
+    conv.u = pkt.data;
+    return (data_narrow_t)conv.f;
+#endif
+}
+{% else %}
+{# Float mode: simpler helpers #}
+static inline void stream_write_data(hls::stream<stream_pkt_t> &s, data_t val, bool last) {
+    stream_pkt_t pkt;
+    union { float f; uint32_t u; } conv;
+    conv.f = val;
+    pkt.data = conv.u;
+    pkt.keep = 0xFF;
+    pkt.strb = 0xFF;
+    pkt.last = last ? 1 : 0;
+    s.write(pkt);
+}
+
+static inline data_t stream_read_data(hls::stream<stream_pkt_t> &s) {
+    stream_pkt_t pkt = s.read();
+    union { uint32_t u; float f; } conv;
+    conv.u = pkt.data;
+    return conv.f;
+}
+#define stream_write_spike stream_write_data
+#define stream_read_spike  stream_read_data
+{% endif %}
+
+// Stage {{ stage_idx }} ({{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }})
+{% if is_first_stage %}
+void stage{{ stage_idx }}(
+    const input_t *ddr_input,
+    hls::stream<stream_pkt_t> &out_stream
+) {
+#pragma HLS INTERFACE m_axi port=ddr_input offset=slave depth={{ in_dim * timesteps }} bundle=gmem
+#pragma HLS INTERFACE axis port=out_stream
+#pragma HLS INTERFACE s_axilite port=ddr_input bundle=control
+#pragma HLS INTERFACE s_axilite port=return    bundle=control
+{% elif is_last_stage %}
+void stage{{ stage_idx }}(
+    hls::stream<stream_pkt_t> &in_stream,
+    output_t *ddr_output
+) {
+#pragma HLS INTERFACE axis port=in_stream
+#pragma HLS INTERFACE m_axi port=ddr_output offset=slave depth={{ out_dim }} bundle=gmem
+#pragma HLS INTERFACE s_axilite port=ddr_output bundle=control
+#pragma HLS INTERFACE s_axilite port=return     bundle=control
+{% else %}
+void stage{{ stage_idx }}(
+    hls::stream<stream_pkt_t> &in_stream,
+    hls::stream<stream_pkt_t> &out_stream
+) {
+#pragma HLS INTERFACE axis port=in_stream
+#pragma HLS INTERFACE axis port=out_stream
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+{% endif %}
+
+    // LIF parameters
+    static const data_t BETA = ((data_t){{ lif_beta }});
+    static const data_t VTH  = ((data_t){{ lif_vth }});
+
+    // LIF state is static so it persists across HLS calls for multi-inference.
+    static lif_mem_t mem[{{ lif_out_dim }}];
+{% if use_fixed %}
+    static spike_t spk[{{ lif_out_dim }}];
+{% else %}
+    static data_t spk[{{ lif_out_dim }}];
+{% endif %}
+    static data_t rst[{{ lif_out_dim }}];
+
+    // Zero-initialize LIF state
+    INIT_STATE: for (int i = 0; i < {{ lif_out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+        mem[i] = (lif_mem_t)0;
+{% if use_fixed %}
+        spk[i] = (spike_t)0;
+{% else %}
+        spk[i] = (data_t)0;
+{% endif %}
+        rst[i] = (data_t)0;
+    }
+
+{% if is_last_stage %}
+    // Output accumulator
+{% if use_fixed %}
+    spike_acc_t acc[{{ out_dim }}];
+{% else %}
+    data_t acc[{{ out_dim }}];
+{% endif %}
+    INIT_ACC: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS UNROLL
+{% endif %}
+{% if use_fixed %}
+        acc[i] = (spike_acc_t)0;
+{% else %}
+        acc[i] = (data_t)0;
+{% endif %}
+    }
+{% if use_pragma %}
+#pragma HLS ARRAY_PARTITION variable=acc complete dim=1
+{% endif %}
+{% endif %}
+
+    // T-loop: {{ timesteps }} timesteps
+    TIMESTEP_LOOP: for (int t = 0; t < TIMESTEPS; t++) {
+{% if use_pragma %}
+#pragma HLS LOOP_TRIPCOUNT min={{ timesteps }} max={{ timesteps }}
+{% endif %}
+
+{% if is_first_stage %}
+        // Read input frame from DDR
+{% if input_is_spike and use_fixed %}
+        spike_t in_buf[{{ in_dim }}];
+{% else %}
+        data_t in_buf[{{ in_dim }}];
+{% endif %}
+{% if encoding == "repeat" %}
+        {# repeat encoding: same frame every timestep #}
+        READ_FRAME: for (int i = 0; i < {{ in_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+{% if input_is_spike and use_fixed %}
+            in_buf[i] = (spike_t)(ddr_input[i] != 0);
+{% else %}
+            in_buf[i] = ((data_t)ddr_input[i]);
+{% endif %}
+        }
+{% else %}
+        {# temporal / rate encoding: frame t #}
+        const input_t *frame_ptr = ddr_input + (size_t)t * {{ in_dim }};
+        READ_FRAME: for (int i = 0; i < {{ in_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+{% if input_is_spike and use_fixed %}
+            in_buf[i] = (spike_t)(frame_ptr[i] != 0);
+{% else %}
+            in_buf[i] = ((data_t)frame_ptr[i]);
+{% endif %}
+        }
+{% endif %}
+{% else %}
+        // Read from input stream
+{% if use_fixed and input_is_spike %}
+        spike_t in_buf[{{ in_dim }}];
+        READ_STREAM: for (int i = 0; i < {{ in_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            in_buf[i] = stream_read_spike(in_stream);
+        }
+{% elif use_fixed and input_is_narrow_data %}
+        data_narrow_t in_buf[{{ in_dim }}];
+        READ_STREAM: for (int i = 0; i < {{ in_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            in_buf[i] = stream_read_narrow(in_stream);
+        }
+{% else %}
+        data_t in_buf[{{ in_dim }}];
+        READ_STREAM: for (int i = 0; i < {{ in_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            in_buf[i] = stream_read_data(in_stream);
+        }
+{% endif %}
+{% endif %}
+
+        // Stage computation
+{% for layer in non_lif_layers %}
+{% if layer.type in ["AvgPool2d", "MaxPool2d"] %}
+{% if not (layer.is_last_in_stage is defined and layer.is_last_in_stage) %}
+{% if use_fixed and layer.global_idx in spike_input_layers and layer.type == "MaxPool2d" %}
+        spike_t buf_pool{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
+{% elif use_fixed and layer.global_idx in spike_input_layers and layer.type == "AvgPool2d" %}
+        data_narrow_t buf_pool{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
+{% else %}
+        data_t buf_pool{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
+{% endif %}
+{% if use_pragma %}
+{% if layer.out_dim <= 16 %}
+#pragma HLS ARRAY_PARTITION variable=buf_pool{{ layer.global_idx }} complete dim=1
+{% else %}
+#pragma HLS ARRAY_PARTITION variable=buf_pool{{ layer.global_idx }} cyclic factor={{ parallel_factor | default(8) }} dim=1
+{% endif %}
+{% endif %}
+{% endif %}
+{% elif layer.type == "DepthwiseConv2d" %}
+        data_t buf_dw{{ layer.pair_idx }}[{{ layer.out_dim }}] = {0};
+{% if use_pragma %}
+{% if layer.out_dim <= 16 %}
+#pragma HLS ARRAY_PARTITION variable=buf_dw{{ layer.pair_idx }} complete dim=1
+{% else %}
+#pragma HLS ARRAY_PARTITION variable=buf_dw{{ layer.pair_idx }} cyclic factor={{ parallel_factor | default(8) }} dim=1
+{% endif %}
+{% endif %}
+{% else %}
+        data_t buf{{ layer.pair_idx }}[{{ layer.out_dim }}] = {0};
+{% if use_pragma %}
+{% if layer.type == "Conv2d" and layer.oc_factor and layer.oc_factor > 0 %}
+{# Block-partition the OC-unrolled Conv2d output so each output channel writes its own bank. #}
+#pragma HLS ARRAY_PARTITION variable=buf{{ layer.pair_idx }} block factor={{ layer.oc_factor }} dim=1
+{% elif layer.out_dim <= 16 %}
+#pragma HLS ARRAY_PARTITION variable=buf{{ layer.pair_idx }} complete dim=1
+{% else %}
+#pragma HLS ARRAY_PARTITION variable=buf{{ layer.pair_idx }} cyclic factor={{ parallel_factor | default(8) }} dim=1
+{% endif %}
+{% endif %}
+{% endif %}
+{% endfor %}
+
+{% if use_fixed and output_is_spike %}
+        spike_t out_buf[{{ out_dim }}] = {0};
+{% elif use_fixed and output_is_narrow_data %}
+        data_narrow_t out_buf[{{ out_dim }}] = {0};
+{% else %}
+        data_t out_buf[{{ out_dim }}] = {0};
+{% endif %}
+
+{% set ns = namespace(prev_buf="in_buf") %}
+{% for layer in all_layers %}
+{% if layer.type == "Linear" %}
+        fc_layer{{ layer.global_idx }}(buf{{ layer.pair_idx }}, {{ ns.prev_buf }});
+{% set ns.prev_buf = "buf" ~ layer.pair_idx %}
+{% elif layer.type == "DepthwiseConv2d" %}
+        dw_conv_layer{{ layer.global_idx }}(buf_dw{{ layer.pair_idx }}, {{ ns.prev_buf }});
+{% set ns.prev_buf = "buf_dw" ~ layer.pair_idx %}
+{% elif layer.type == "Conv2d" %}
+        conv_layer{{ layer.global_idx }}(buf{{ layer.pair_idx }}, {{ ns.prev_buf }});
+{% set ns.prev_buf = "buf" ~ layer.pair_idx %}
+{% elif layer.type in ["AvgPool2d", "MaxPool2d"] %}
+{% if layer.is_last_in_stage is defined and layer.is_last_in_stage %}
+        pool_layer{{ layer.global_idx }}(out_buf, {{ ns.prev_buf }});
+{% set ns.prev_buf = "out_buf" %}
+{% else %}
+        pool_layer{{ layer.global_idx }}(buf_pool{{ layer.global_idx }}, {{ ns.prev_buf }});
+{% set ns.prev_buf = "buf_pool" ~ layer.global_idx %}
+{% endif %}
+{% elif layer.type == "LIF" %}
+{% if layer.is_last_in_stage is defined and not layer.is_last_in_stage %}
+{% if use_fixed %}
+        spike_t buf_lif{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
+{% else %}
+        data_t buf_lif{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
+{% endif %}
+        neuron_layer{{ layer.global_idx }}(buf_lif{{ layer.global_idx }}, {{ ns.prev_buf }}, mem, spk, rst, BETA, VTH);
+{% if layer.reset_mechanism|default('subtract') != 'zero' %}
+        reset_node(rst, spk, VTH, {{ layer.out_dim }});
+{% endif %}
+{% set ns.prev_buf = "buf_lif" ~ layer.global_idx %}
+{% else %}
+        neuron_layer{{ layer.global_idx }}(out_buf, {{ ns.prev_buf }}, mem, spk, rst, BETA, VTH);
+{% if layer.reset_mechanism|default('subtract') != 'zero' %}
+        reset_node(rst, spk, VTH, {{ layer.out_dim }});
+{% endif %}
+{% endif %}
+{% endif %}
+{% endfor %}
+
+{% if is_last_stage %}
+        // Accumulate
+        ACCUMULATE: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS UNROLL
+{% endif %}
+{% if use_fixed %}
+            acc[i] += (spike_acc_t)out_buf[i];
+{% else %}
+            acc[i] += out_buf[i];
+{% endif %}
+        }
+{% else %}
+        // Write to output stream
+{% if use_fixed and output_is_spike %}
+        WRITE_STREAM: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            stream_write_spike(out_stream, out_buf[i], (i == {{ out_dim }} - 1));
+        }
+{% elif use_fixed and output_is_narrow_data %}
+        WRITE_STREAM: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            stream_write_narrow(out_stream, out_buf[i], (i == {{ out_dim }} - 1));
+        }
+{% else %}
+        WRITE_STREAM: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+            stream_write_data(out_stream, out_buf[i], (i == {{ out_dim }} - 1));
+        }
+{% endif %}
+{% endif %}
+
+    } // end TIMESTEP_LOOP
+
+{% if is_last_stage %}
+    // Scaled output: acc / 2^{{ output_shift }} via a fixed-point right shift instead of /TIMESTEPS. 
+    // 2^{{ output_shift }} >= TIMESTEPS so the result stays in [0,1]; the shift is free
+    // and argmax is scale-invariant, so the exact divisor is irrelevant. 
+    WRITE_OUTPUT: for (int i = 0; i < {{ out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+{% if use_fixed %}
+        ddr_output[i] = (output_t)(((data_t)acc[i]) >> {{ output_shift }});
+{% else %}
+        ddr_output[i] = (output_t)(acc[i] / ((data_t)TIMESTEPS));
+{% endif %}
+    }
+{% endif %}
+}

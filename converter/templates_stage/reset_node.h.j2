@@ -1,0 +1,48 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#ifndef RESET_NODE_H
+#define RESET_NODE_H
+
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_uint<1> spike_t;
+#else
+#include <stdint.h>
+typedef float data_t;
+typedef uint8_t spike_t;
+#endif
+{% else %}
+typedef float data_t;
+{% endif %}
+
+// Set reset vector from spikes: reset[i] = spk[i] * v_reset.
+void reset_node(
+    data_t *reset,
+{% if use_fixed %}
+    const spike_t *spk,
+{% else %}
+    const data_t *spk,
+{% endif %}
+    data_t v_reset,
+    int len
+);
+
+#endif // RESET_NODE_H

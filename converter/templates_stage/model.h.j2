@@ -1,0 +1,90 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#ifndef MODEL_H
+#define MODEL_H
+
+#define TIMESTEPS {{ timesteps }}
+#define OUTPUT_DIM {{ output_dim }}
+
+// SD card data path prefix (for main_sd.c)
+#define SD_DATA_DIR "0:/{{ sd_data_dir }}"
+#define SD_NUM_SAMPLES {{ sd_num_samples }}
+#define SD_SAMPLES_PER_FILE {{ sd_samples_per_file }}  // 0 = single fall.bin; >0 = fall0.bin, fall1.bin, ...
+
+// Flattened input dimension
+#define INPUT_DIM_FLAT {{ input_dim_flat }}
+
+// Backward compatibility
+#define INPUT_DIM INPUT_DIM_FLAT
+
+{% if input_c is not none %}
+// C/H/W dimensions (optional)
+#define INPUT_C {{ input_c }}
+#define INPUT_H {{ input_h }}
+#define INPUT_W {{ input_w }}
+{% endif %}
+
+#define NUM_LIF {{ num_lif_layers }}
+
+// Input encoding: 1=repeat (reuse per timestep), 0=rate (T*D inputs)
+{% if input_is_repeat %}
+#define INPUT_ENCODING_REPEAT 1
+{% else %}
+#define INPUT_ENCODING_REPEAT 0
+{% endif %}
+
+{% if use_fixed %}
+// Flag for main_sd.c auto-detection of USE_FIXED
+#define HLS_FIXED_MODE 1
+
+// Auto-adaptive fixed-point types
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_int.h>
+#include <ap_fixed.h>
+typedef ap_uint<1> spike_t;
+typedef {{ input_hls_type }} input_t;
+typedef {{ output_hls_type }} output_t;
+typedef {{ acc_hls_type }} spike_acc_t;
+#else
+#include <stdint.h>
+typedef uint8_t spike_t;
+typedef {{ input_gcc_type }} input_t;
+typedef {{ output_gcc_type }} output_t;
+typedef {{ acc_gcc_type }} spike_acc_t;
+#endif
+
+// Type config macros (for main_sd.c AXI conversion)
+#define INPUT_TYPE_IS_INT   {{ 1 if input_fixed_config.type_class in ['uint','int'] else 0 }}
+#define INPUT_TYPE_UNSIGNED {{ 1 if input_fixed_config.type_class in ['uint','ufixed'] else 0 }}
+#define INPUT_TOTAL_W       {{ input_fixed_config.width }}
+#define INPUT_INT_W         {{ input_fixed_config.int }}
+#define OUTPUT_TYPE_IS_INT  {{ 1 if output_fixed_config.type_class in ['uint','int'] else 0 }}
+#define OUTPUT_TYPE_UNSIGNED {{ 1 if output_fixed_config.type_class in ['uint','ufixed'] else 0 }}
+#define OUTPUT_TOTAL_W      {{ output_fixed_config.width }}
+#define OUTPUT_INT_W        {{ output_fixed_config.int }}
+
+void inference(const input_t *input, output_t *output);
+{% else %}
+// Float mode: input_t/output_t as float for unified test harness
+typedef float input_t;
+typedef float output_t;
+
+void inference(const float *input, float *output);
+{% endif %}
+
+#endif // MODEL_H

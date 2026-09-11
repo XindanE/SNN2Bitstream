@@ -1,0 +1,132 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+# Vitis (xsct) workspace for the {{ num_stages }}-stage streaming pipeline: xilffs BSP plus streaming application. Auto-generated; DO NOT EDIT.
+
+set proj_dir [file normalize [pwd]]
+set proj_name "streaming"
+
+# Auto-detect XSA
+set xsa_candidates [glob -nocomplain -directory $proj_dir vivado_*_streaming_zcu104/*.xsa]
+if {[llength $xsa_candidates] == 0} {
+    puts "[Error] No streaming .xsa file found"
+    exit 1
+}
+set xsa_path [lindex $xsa_candidates end]
+
+set ws_dir   [file normalize "$proj_dir/vitis_streaming"]
+set hw_name  "HW_streaming"
+set sw_name  "SW_streaming"
+
+# Find main_sd_streaming.c
+set main_src ""
+# Use argv[0] only if it points to an existing file; [file isfile] guards against a caller passing a non-path argument.
+if {$argc >= 1 && [file isfile [file normalize [lindex $argv 0]]]} {
+    set main_src [file normalize [lindex $argv 0]]
+}
+# Fallback: search common locations for main_sd_streaming.c
+if {$main_src eq ""} {
+    set search_paths [list \
+        "$proj_dir/main_sd_streaming.c" \
+        "$proj_dir/../../tools/main_sd_streaming.c" \
+        "$proj_dir/../../../tools/main_sd_streaming.c" \
+    ]
+    foreach p $search_paths {
+        if {[file exists $p]} {
+            set main_src [file normalize $p]
+            break
+        }
+    }
+}
+
+puts "  Vitis Streaming Pipeline"
+puts "  XSA:       $xsa_path"
+puts "  Workspace: $ws_dir"
+puts "  main_src:  $main_src"
+
+# Step 1: Workspace
+if {[file exists $ws_dir]} { file delete -force $ws_dir }
+setws $ws_dir
+
+# Step 2: Platform
+platform create -name $hw_name \
+    -hw $xsa_path \
+    -proc {psu_cortexa53_0} \
+    -os {standalone} \
+    -arch {64-bit} \
+    -fsbl-target {psu_cortexa53_0} \
+    -out $ws_dir
+platform write
+
+# Step 3: BSP + xilffs
+platform active $hw_name
+domain active {zynqmp_fsbl}
+bsp reload
+domain active {standalone_domain}
+bsp reload
+# Do not pin -ver: the xilffs version differs across Vitis releases and a stale pin fails the BSP; omitting it uses the version bundled with the running Vitis.
+bsp setlib -name xilffs
+bsp write
+bsp reload
+catch {bsp regenerate}
+
+# Step 4: Build platform
+platform generate
+
+# Step 5: Application
+app create -name $sw_name \
+    -platform $hw_name \
+    -domain {standalone_domain} \
+    -proc {psu_cortexa53_0} \
+    -os {standalone} \
+    -lang {c} \
+    -template {Empty Application}
+
+set sw_src_dir "$ws_dir/$sw_name/src"
+
+if {$main_src ne "" && [file exists $main_src]} {
+    file copy -force $main_src "$sw_src_dir/main_sd_streaming.c"
+    puts "  Copied: $main_src"
+}
+
+# Copy model.h. Prefer the converter's fresh cpp/model.h: the assembled xilinx/model.h is
+# only refreshed by run_xilinx.sh, so re-running just the converter would leave it stale.
+set model_h_candidates [list \
+    "$proj_dir/../../cpp/model.h" \
+    "$proj_dir/../model.h" \
+    "$proj_dir/stage0/stage0_top.h" \
+]
+foreach mh $model_h_candidates {
+    if {[file exists $mh]} {
+        file copy -force $mh "$sw_src_dir/[file tail $mh]"
+        puts "  Copied: $mh"
+        break
+    }
+}
+
+# Step 6: Build
+app build -name $sw_name
+
+set elf_path "$ws_dir/$sw_name/Debug/${sw_name}.elf"
+puts "  Vitis Streaming Build Done"
+if {[file exists $elf_path]} {
+    puts "  ELF: $elf_path"
+} else {
+    puts "  ELF: (check build log)"
+}
+
+exit

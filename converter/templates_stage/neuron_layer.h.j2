@@ -1,0 +1,61 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#ifndef NEURON_LAYER{{ index }}_H
+#define NEURON_LAYER{{ index }}_H
+
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+{% if layer.lif_mem_narrow|default(False) %}
+typedef ap_fixed<{{ layer.lif_mem_width }}, {{ layer.lif_mem_int }}, AP_TRN, AP_SAT> lif_mem_t_{{ index }};
+{% else %}
+typedef data_t lif_mem_t_{{ index }};
+{% endif %}
+typedef ap_uint<1> spike_t;
+#else
+#include <stdint.h>
+typedef float data_t;
+typedef float lif_mem_t_{{ index }};
+typedef uint8_t spike_t;
+#endif
+{% else %}
+typedef float data_t;
+typedef float lif_mem_t_{{ index }};
+{% endif %}
+
+void neuron_layer{{ index }}(
+{% if use_fixed %}
+    spike_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}],
+    lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
+    spike_t spk[{{ layer.out_dim }}],
+    data_t reset[{{ layer.out_dim }}],
+{% else %}
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}],
+    lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
+    data_t spk[{{ layer.out_dim }}],
+    data_t reset[{{ layer.out_dim }}],
+{% endif %}
+    data_t beta,
+    data_t v_th
+);
+
+#endif // NEURON_LAYER{{ index }}_H

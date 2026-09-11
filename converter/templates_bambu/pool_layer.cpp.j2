@@ -1,0 +1,67 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// {{ "Max" if pool_type is defined and pool_type == "max" else "Average" }} Pooling Layer {{ index }}
+#include "pool_layer{{ index }}.h"
+#include <stddef.h>
+
+typedef float data_t;
+typedef double acc_t;
+
+void pool_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}]
+) {
+    const int C  = {{ layer.channels }};
+    const int IH = {{ layer.in_h }};
+    const int IW = {{ layer.in_w }};
+    const int OH = {{ layer.out_h }};
+    const int OW = {{ layer.out_w }};
+    const int K  = {{ layer.kernel_size }};
+    const int S  = {{ layer.stride }};
+
+    for (int c = 0; c < C; c++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+{% if pool_type is defined and pool_type == "max" %}
+                data_t max_val = in[c * IH * IW + (oh * S) * IW + (ow * S)];
+                for (int kh = 0; kh < K; kh++) {
+                    for (int kw = 0; kw < K; kw++) {
+                        int ih = oh * S + kh;
+                        int iw = ow * S + kw;
+                        int in_idx = c * IH * IW + ih * IW + iw;
+                        data_t val = in[in_idx];
+                        if (val > max_val) max_val = val;
+                    }
+                }
+                out[c * OH * OW + oh * OW + ow] = max_val;
+{% else %}
+                acc_t sum = 0;
+                for (int kh = 0; kh < K; kh++) {
+                    for (int kw = 0; kw < K; kw++) {
+                        int ih = oh * S + kh;
+                        int iw = ow * S + kw;
+                        int in_idx = c * IH * IW + ih * IW + iw;
+                        sum += (acc_t)in[in_idx];
+                    }
+                }
+                out[c * OH * OW + oh * OW + ow] = (data_t)(sum / (K * K));
+{% endif %}
+            }
+        }
+    }
+}

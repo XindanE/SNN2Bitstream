@@ -1,0 +1,19 @@
+# Python dependencies for SNN2Bitstream (software / code-generation flow).
+# Validated with Python 3.10. Pins are the tested versions; loosen if needed.
+#
+# The Xilinx hardware flow (Vitis HLS / Vivado / Vitis 2020.2) is a separate, licensed
+# toolchain and is NOT installable via pip -- see README for its setup.
+
+# Core: training and the SNN runtime
+torch==2.5.1
+torchvision==0.20.1
+snntorch==0.9.4
+numpy==1.26.4
+
+# Code generation (IR -> C++ via Jinja2; TOML configs)
+jinja2==3.1.6
+toml==0.10.2
+
+# Event-based datasets (N-MNIST, DVS Gesture, CIFAR10-DVS)
+tonic==1.6.0
+aedat==2.2.0

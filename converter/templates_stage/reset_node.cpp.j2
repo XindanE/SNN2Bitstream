@@ -1,0 +1,54 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#include "reset_node.h"
+
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_int.h>
+typedef ap_uint<1> spike_t;
+#else
+#include <stdint.h>
+typedef uint8_t spike_t;
+#endif
+{% endif %}
+
+void reset_node(
+    data_t *reset,
+{% if use_fixed %}
+    const spike_t *spk,
+{% else %}
+    const data_t *spk,
+{% endif %}
+    data_t v_reset,
+    int len
+) {
+{% if use_pragma %}
+#pragma HLS INLINE
+{% endif %}
+    for (int i = 0; i < len; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+{% if use_fixed %}
+        // spk is 0/1: a select avoids a multiply (a DSP when v_reset is an arbitrary constant).
+        reset[i] = spk[i] ? v_reset : (data_t)0;
+{% else %}
+        reset[i] = (spk[i] != (data_t)0) ? v_reset : (data_t)0;
+{% endif %}
+    }
+}

@@ -1,0 +1,98 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Streaming stage {{ stage_idx }} header. Auto-generated; DO NOT EDIT.
+// {{ description }} (role: {{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }}, in {{ in_dim }}, out {{ out_dim }})
+#ifndef STAGE{{ stage_idx }}_TOP_H
+#define STAGE{{ stage_idx }}_TOP_H
+
+#define TIMESTEPS     {{ timesteps }}
+#define S{{ stage_idx }}_IN_DIM   {{ in_dim }}
+#define S{{ stage_idx }}_OUT_DIM  {{ out_dim }}
+{% if is_last_stage %}
+#define OUTPUT_DIM    {{ out_dim }}
+{% endif %}
+
+// Types
+{% if use_fixed %}
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_uint<1> spike_t;
+typedef {{ input_hls_type }} input_t;
+typedef {{ output_hls_type }} output_t;
+typedef {{ acc_hls_type }} spike_acc_t;
+#else
+#include <stdint.h>
+typedef float data_t;
+typedef uint8_t spike_t;
+typedef {{ input_gcc_type }} input_t;
+typedef {{ output_gcc_type }} output_t;
+typedef {{ acc_gcc_type }} spike_acc_t;
+#endif
+{% else %}
+typedef float data_t;
+typedef float input_t;
+typedef float output_t;
+typedef float spike_acc_t;
+{% endif %}
+
+// AXI-Stream packet
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+typedef ap_axiu<32, 0, 0, 0> stream_pkt_t;
+#else
+#include <cstdint>
+#include <queue>
+struct stream_pkt_t {
+    uint32_t data;
+    uint8_t  last;
+    uint8_t  keep;
+    uint8_t  strb;
+};
+namespace hls {
+template<typename T> class stream {
+    std::queue<T> q;
+public:
+    void write(const T& v) { q.push(v); }
+    T read() { T v = q.front(); q.pop(); return v; }
+    bool empty() const { return q.empty(); }
+};
+}
+#endif
+
+// Function declaration
+{% if is_first_stage %}
+void stage{{ stage_idx }}(
+    const input_t *ddr_input,
+    hls::stream<stream_pkt_t> &out_stream
+);
+{% elif is_last_stage %}
+void stage{{ stage_idx }}(
+    hls::stream<stream_pkt_t> &in_stream,
+    output_t *ddr_output
+);
+{% else %}
+void stage{{ stage_idx }}(
+    hls::stream<stream_pkt_t> &in_stream,
+    hls::stream<stream_pkt_t> &out_stream
+);
+{% endif %}
+
+#endif // STAGE{{ stage_idx }}_TOP_H

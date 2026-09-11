@@ -1,0 +1,201 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Depthwise Convolutional Layer {{ index }}
+#include "dw_conv_layer{{ index }}.h"
+#include "weights{{ layer.pair_idx }}.h"
+#include "biases{{ layer.pair_idx }}.h"
+#include <stddef.h>
+#include <stdint.h>
+
+{% if use_fixed %}
+// Fixed-point mode
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_int.h>
+#include <ap_fixed.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_ufixed<16, 1, AP_TRN, AP_SAT> data_narrow_t;  // pooled-spike activations in [0,1]
+typedef ap_uint<1> spike_t;
+{% if quant_weight %}
+typedef ap_int<{{ quant_weight.bit_width }}> w_t;
+// Per-layer precision sized for this layer's own weight and bias scales.
+typedef ap_fixed<{{ layer.scale_width|default(scale_config.width) }}, {{ layer.scale_int|default(scale_config.int) }}, AP_TRN, AP_SAT> scale_t;
+{% else %}
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> w_t;
+typedef data_t scale_t;
+{% endif %}
+// Per-layer MAC accumulator sized to ceil(log2(N_MAC * max_w * max_in)) + sign + frac bits.
+typedef ap_fixed<{{ layer.acc_width|default(fixed_config.width * 2) }}, {{ layer.acc_int|default(fixed_config.int * 2) }}, AP_TRN, AP_SAT> acc_t;
+#else
+typedef float data_t;
+typedef float data_narrow_t;
+typedef uint8_t spike_t;
+{% if quant_weight %}
+typedef int32_t w_t;
+{% else %}
+typedef float w_t;
+{% endif %}
+typedef double acc_t;
+typedef double scale_t;
+#endif
+{% else %}
+// Float mode
+typedef float data_t;
+typedef float data_narrow_t;
+{% if quant_weight %}
+typedef int32_t w_t;
+{% else %}
+typedef float w_t;
+{% endif %}
+typedef double acc_t;
+{% endif %}
+
+void dw_conv_layer{{ index }}(
+    data_t out[{{ layer.channels * layer.out_h * layer.out_w }}],
+{% if use_fixed and input_is_spike %}
+    const spike_t in[{{ layer.channels * layer.in_h * layer.in_w }}]
+{% elif use_fixed and layer.input_is_narrow_data is defined and layer.input_is_narrow_data %}
+    const data_narrow_t in[{{ layer.channels * layer.in_h * layer.in_w }}]
+{% else %}
+    const data_t in[{{ layer.channels * layer.in_h * layer.in_w }}]
+{% endif %}
+) {
+#pragma HLS INLINE off
+{% if use_pragma %}
+{% if "conv_kernel" in opt_tags %}
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=2
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=3
+{% endif %}
+{% endif %}
+
+{% if quant_weight %}
+    // scale_t carries higher precision so small values are not truncated to 0.
+    const scale_t weight_scale = ((scale_t)({{ quant_weight.scale }}));
+    const scale_t bias_scale = ((scale_t)({{ quant_bias.scale }}));
+    const int bias_zero_point = {{ quant_bias.zero_point }};
+    // Bias dequant precomputed in Python double; see conv_layer for the precision rationale.
+    const data_t bias_dequant_table[{{ layer.channels }}] = {
+{% for v in bias_dequant_table %}
+        ((data_t){{ "%.17g" | format(v) }}),
+{% endfor %}
+    };
+{% endif %}
+
+    const int C  = {{ layer.channels }};
+    const int IH = {{ layer.in_h }};
+    const int IW = {{ layer.in_w }};
+    const int OH = {{ layer.out_h }};
+    const int OW = {{ layer.out_w }};
+    const int K  = {{ layer.kernel_size }};
+    const int S  = {{ layer.stride }};
+    const int P  = {{ layer.padding }};
+
+
+{% if conv_partition_factor > 0 %}
+    // Local input copy for read bandwidth. Partition factor={{ conv_partition_factor }} is auto-capped for LUTRAM safety.
+{% if use_fixed and input_is_spike %}
+    // Spike input is 1-bit: keep the buffer as spike_t to save BRAM/registers.
+    spike_t local_in[{{ layer.channels * layer.in_h * layer.in_w }}];
+{% else %}
+    data_t local_in[{{ layer.channels * layer.in_h * layer.in_w }}];
+{% endif %}
+#pragma HLS ARRAY_PARTITION variable=local_in cyclic factor={{ conv_partition_factor }}
+    DW_CONV{{ index }}_LOAD_IN: for (int i = 0; i < C * IH * IW; i++) {
+#pragma HLS PIPELINE II=1
+{% if use_fixed and input_is_spike %}
+        local_in[i] = in[i];
+{% else %}
+        local_in[i] = (data_t)in[i];
+{% endif %}
+    }
+{% endif %}
+
+    for (int c = 0; c < C; c++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+#pragma HLS DEPENDENCE variable=weights{{ layer.pair_idx }} inter false
+#pragma HLS DEPENDENCE variable=out inter false
+{% endif %}
+{% if quant_weight %}
+                acc_t acc = 0;
+{% else %}
+                acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[c]));
+{% endif %}
+                for (int kh = 0; kh < K; kh++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                    for (int kw = 0; kw < K; kw++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                        int ih = oh * S - P + kh;
+                        int iw = ow * S - P + kw;
+                        if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+                            int in_idx = c * IH * IW + ih * IW + iw;
+{% if conv_partition_factor > 0 %}
+{% if input_is_spike %}
+                            acc += local_in[in_idx] ? (acc_t)weights{{ layer.pair_idx }}[c][kh][kw] : (acc_t)0;
+{% else %}
+                            acc += (acc_t)weights{{ layer.pair_idx }}[c][kh][kw] * (acc_t)local_in[in_idx];
+{% endif %}
+{% else %}
+{% if input_is_spike %}
+                            acc += in[in_idx] ? (acc_t)weights{{ layer.pair_idx }}[c][kh][kw] : (acc_t)0;
+{% else %}
+                            acc += (acc_t)weights{{ layer.pair_idx }}[c][kh][kw] * (acc_t)in[in_idx];
+{% endif %}
+{% endif %}
+                        }
+                    }
+                }
+{% if quant_weight %}
+                data_t bias_dequant = bias_dequant_table[c];
+                out[c * OH * OW + oh * OW + ow] = (data_t)(acc * weight_scale) + bias_dequant;
+{% else %}
+                out[c * OH * OW + oh * OW + ow] = (data_t)acc;
+{% endif %}
+            }
+        }
+    }
+{% if act_quant %}
+    // Activation quantize-dequantize to match QAT training behavior.
+    {
+        const scale_t activation_scale = ((scale_t)({{ act_quant.scale }}));
+        const int activation_zero_point = {{ act_quant.zero_point }};
+        const int OUT_SIZE = C * OH * OW;
+        for (int i = 0; i < OUT_SIZE; i++) {
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+            // Clamp to uint8 range then reconstruct.
+            acc_t q = (acc_t)out[i] / (acc_t)activation_scale + (acc_t)activation_zero_point;
+            int q_int = (int)q;
+            if (q_int < 0) q_int = 0;
+            if (q_int > 255) q_int = 255;
+            out[i] = (data_t)((acc_t)(q_int - activation_zero_point) * (acc_t)activation_scale);
+#else
+            double q = (double)out[i] / (double)activation_scale + (double)activation_zero_point;
+            int q_int = (int)(q + 0.5);
+            if (q_int < 0) q_int = 0;
+            if (q_int > 255) q_int = 255;
+            out[i] = (data_t)((double)(q_int - activation_zero_point) * (double)activation_scale);
+#endif
+        }
+    }
+{% endif %}
+}

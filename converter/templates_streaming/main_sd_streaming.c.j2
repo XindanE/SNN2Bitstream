@@ -1,0 +1,498 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// SNN streaming inference on ZCU104. Auto-generated for a {{ num_stages }}-stage pipeline; DO NOT EDIT.
+// PS sets DDR addresses for the FIRST and LAST stages and starts all stages; stages self-synchronize via AXI-Stream FIFOs.
+
+#include "xparameters.h"
+{% for sidx in range(num_stages) %}
+#include "xstage{{ sidx }}.h"
+{% endfor %}
+#include "xil_printf.h"
+#include "xuartps.h"
+#include "xgpio.h"
+#include "xtime_l.h"
+#include "xil_cache.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "ff.h"
+#include "model.h"
+
+#ifndef USE_FIXED
+#ifdef HLS_FIXED_MODE
+#define USE_FIXED 1
+#else
+#define USE_FIXED 0
+#endif
+#endif
+
+#ifndef SD_DATA_DIR
+#define SD_DATA_DIR "0:"
+#endif
+#define SD_FALL_FILE   SD_DATA_DIR "/fall.bin"
+#define SD_LABEL_FILE  SD_DATA_DIR "/labels.bin"
+
+// fall.bin is split into fall0.bin, fall1.bin, ... when the full test set would exceed
+// the FAT32 4 GiB/file limit. SD_SAMPLES_PER_FILE = samples per split file; 0 = single fall.bin.
+#ifndef SD_SAMPLES_PER_FILE
+#define SD_SAMPLES_PER_FILE 0
+#endif
+
+#ifdef SD_NUM_SAMPLES
+#define NUM_SAMPLES    SD_NUM_SAMPLES
+#else
+#define NUM_SAMPLES    10000
+#endif
+#define START_SAMPLE   0
+#define END_SAMPLE     NUM_SAMPLES
+
+#ifndef INPUT_ENCODING_REPEAT
+#define INPUT_ENCODING_REPEAT 0
+#endif
+#if INPUT_ENCODING_REPEAT
+#define ENCODED_SIZE   INPUT_DIM
+#else
+#define ENCODED_SIZE   (INPUT_DIM * TIMESTEPS)
+#endif
+#define ENCODED_BYTES  (ENCODED_SIZE * sizeof(float))
+#define OUTPUT_SIZE    OUTPUT_DIM
+
+#ifndef INPUT_TOTAL_W
+#define INPUT_TYPE_IS_INT    0
+#define INPUT_TYPE_UNSIGNED  0
+#define INPUT_TOTAL_W        32
+#define INPUT_INT_W          32
+#endif
+#ifndef OUTPUT_TOTAL_W
+#define OUTPUT_TYPE_IS_INT   0
+#define OUTPUT_TYPE_UNSIGNED 0
+#define OUTPUT_TOTAL_W       32
+#define OUTPUT_INT_W         32
+#endif
+#define INPUT_FRAC   (INPUT_TOTAL_W - INPUT_INT_W)
+#define INPUT_SCALE  (1 << INPUT_FRAC)
+#define OUTPUT_FRAC  (OUTPUT_TOTAL_W - OUTPUT_INT_W)
+#define OUTPUT_SCALE (1 << OUTPUT_FRAC)
+
+#define UART_DEVICE_ID  XPAR_XUARTPS_0_DEVICE_ID
+#define GPIO_DEVICE_ID  XPAR_GPIO_0_DEVICE_ID
+#define LED_CHANNEL     1
+
+// AXI types
+#if USE_FIXED
+  #if INPUT_TOTAL_W <= 8
+    typedef int8_t axi_input_t;
+  #elif INPUT_TOTAL_W <= 16
+    typedef int16_t axi_input_t;
+  #else
+    typedef int32_t axi_input_t;
+  #endif
+  #if OUTPUT_TOTAL_W <= 8
+    typedef int8_t axi_output_t;
+  #elif OUTPUT_TOTAL_W <= 16
+    typedef int16_t axi_output_t;
+  #else
+    typedef int32_t axi_output_t;
+  #endif
+#else
+  typedef float axi_input_t;
+  typedef float axi_output_t;
+#endif
+
+static FATFS fatfs;
+static FIL fall_fil;
+static int fall_open_idx = -1;   // which split file is currently open (-1 = none)
+static XGpio Gpio;
+static XUartPs Uart_Ps;
+
+static float sd_read_buf[ENCODED_SIZE] __attribute__((aligned(64)));
+static axi_input_t  input_buf[ENCODED_SIZE] __attribute__((aligned(64)));
+static axi_output_t output_buf[OUTPUT_SIZE] __attribute__((aligned(64)));
+static int labels[NUM_SAMPLES];
+
+
+void print_float(float f) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.4f", f);
+    xil_printf("%s", buf);
+}
+
+int init_uart() {
+    XUartPs_Config *c = XUartPs_LookupConfig(UART_DEVICE_ID);
+    if (!c) return XST_FAILURE;
+    int s = XUartPs_CfgInitialize(&Uart_Ps, c, c->BaseAddress);
+    if (s != XST_SUCCESS) return s;
+    XUartPs_SetBaudRate(&Uart_Ps, 115200);
+    return XST_SUCCESS;
+}
+
+int init_gpio() {
+    int s = XGpio_Initialize(&Gpio, GPIO_DEVICE_ID);
+    if (s != XST_SUCCESS) { xil_printf("GPIO init failed!\r\n"); return s; }
+    XGpio_SetDataDirection(&Gpio, LED_CHANNEL, 0x0);
+    return XST_SUCCESS;
+}
+
+void show_class_on_led(int cls) {
+    XGpio_DiscreteWrite(&Gpio, LED_CHANNEL, (u32)(cls & 0xF));
+}
+
+int argmax_fixed(axi_output_t *arr, int n) {
+    int idx = 0; axi_output_t mx = arr[0];
+    for (int i = 1; i < n; i++) { if (arr[i] > mx) { mx = arr[i]; idx = i; } }
+    return idx;
+}
+
+int argmax_float(float *arr, int n) {
+    int idx = 0; float mx = arr[0];
+    for (int i = 1; i < n; i++) { if (arr[i] > mx) { mx = arr[i]; idx = i; } }
+    return idx;
+}
+
+#if USE_FIXED
+static inline axi_input_t float_to_fixed_input(float val) {
+    int32_t r;
+  #if INPUT_TYPE_IS_INT
+    r = (val >= 0) ? (int32_t)(val + 0.5f) : (int32_t)(val - 0.5f);
+  #else
+    float scaled = val * INPUT_SCALE;
+    r = (scaled >= 0) ? (int32_t)(scaled + 0.5f) : (int32_t)(scaled - 0.5f);
+  #endif
+  #if INPUT_TYPE_UNSIGNED
+    if (r < 0) r = 0;
+    if (r > ((1 << INPUT_TOTAL_W) - 1)) r = (1 << INPUT_TOTAL_W) - 1;
+  #else
+    int32_t mx = (1 << (INPUT_TOTAL_W - 1)) - 1;
+    int32_t mn = -(1 << (INPUT_TOTAL_W - 1));
+    if (r > mx) r = mx;
+    if (r < mn) r = mn;
+  #endif
+    return (axi_input_t)r;
+}
+#endif
+
+// SD card
+
+int mount_sd() {
+    FRESULT res = f_mount(&fatfs, "0:/", 1);
+    if (res != FR_OK) { xil_printf("[Error] SD mount failed (res=%d)\r\n", res); return XST_FAILURE; }
+    xil_printf("SD card mounted.\r\n");
+    return XST_SUCCESS;
+}
+
+int load_labels(const char *path, int *out, int n) {
+    FIL f; UINT br;
+    if (f_open(&f, path, FA_READ) != FR_OK) return XST_FAILURE;
+    FRESULT res = f_read(&f, out, n * sizeof(int), &br);
+    f_close(&f);
+    return (res == FR_OK && br == (UINT)(n * sizeof(int))) ? XST_SUCCESS : XST_FAILURE;
+}
+
+// Open the split file holding sample idx (or the single fall.bin), caching the handle so
+// sequential reads only reopen at each SD_SAMPLES_PER_FILE boundary.
+static int open_fall_for(int idx) {
+    int file_idx = (SD_SAMPLES_PER_FILE > 0) ? (idx / SD_SAMPLES_PER_FILE) : 0;
+    if (file_idx == fall_open_idx) return XST_SUCCESS;
+    if (fall_open_idx >= 0) f_close(&fall_fil);
+    char path[80];
+    if (SD_SAMPLES_PER_FILE > 0)
+        snprintf(path, sizeof(path), "%s/fall%d.bin", SD_DATA_DIR, file_idx);
+    else
+        snprintf(path, sizeof(path), "%s", SD_FALL_FILE);
+    if (f_open(&fall_fil, path, FA_READ) != FR_OK) {
+        xil_printf("[Error] Cannot open %s\r\n", path);
+        fall_open_idx = -1;
+        return XST_FAILURE;
+    }
+    fall_open_idx = file_idx;
+    return XST_SUCCESS;
+}
+
+int load_sample(int idx) {
+    UINT br;
+    if (open_fall_for(idx) != XST_SUCCESS) return XST_FAILURE;
+    int local = (SD_SAMPLES_PER_FILE > 0) ? (idx % SD_SAMPLES_PER_FILE) : idx;
+    if (f_lseek(&fall_fil, (FSIZE_t)local * ENCODED_BYTES) != FR_OK) return XST_FAILURE;
+    FRESULT res = f_read(&fall_fil, sd_read_buf, ENCODED_BYTES, &br);
+    return (res == FR_OK && br == ENCODED_BYTES) ? XST_SUCCESS : XST_FAILURE;
+}
+
+
+// Board power measurement (opt-in). Enable by defining MEASURE_POWER in the Vitis app's
+// C compiler preprocessor symbols, then rebuild the app (no HLS/Vivado rerun needed).
+// ZCU104 power monitors sit on PS I2C1 behind a TCA9548A mux (0x74):
+//   ch3 -> INA226   (0x40)        : 12 V input rail = total board power
+//   ch2 -> IRPS5401 (0x43, 0x44)  : PMIC rails incl. VCCINT/PL core (~0.85 V)
+// Sources: linux-xlnx zynqmp-zcu104-revC.dts, PYNQ ZCU104 pmbus, UG1267.
+#ifdef MEASURE_POWER
+#include "xiicps.h"
+
+#ifndef POWER_IIC_DEVICE_ID
+#ifdef XPAR_XIICPS_1_DEVICE_ID
+#define POWER_IIC_DEVICE_ID XPAR_XIICPS_1_DEVICE_ID
+#else
+#define POWER_IIC_DEVICE_ID XPAR_XIICPS_0_DEVICE_ID
+#endif
+#endif
+
+#define PM_MUX_ADDR          0x74
+#define PM_INA226_ADDR       0x40
+#define PM_INA226_CH         3
+#define PM_INA226_RSHUNT_OHM 0.005f   // 5 mOhm shunt on the 12 V rail
+#define PM_IRPS_CH           2
+
+static XIicPs PmIic;
+
+// 2^n without libm, so the app links on bare-metal without -lm.
+static float pm_pow2(int n) {
+    float r = 1.0f;
+    if (n >= 0) { while (n-- > 0) r *= 2.0f; }
+    else        { while (n++ < 0) r *= 0.5f; }
+    return r;
+}
+
+static int pm_iic_init(void) {
+    XIicPs_Config *c = XIicPs_LookupConfig(POWER_IIC_DEVICE_ID);
+    if (!c) return XST_FAILURE;
+    if (XIicPs_CfgInitialize(&PmIic, c, c->BaseAddress) != XST_SUCCESS) return XST_FAILURE;
+    XIicPs_SetSClk(&PmIic, 100000);
+    return XST_SUCCESS;
+}
+
+static int pm_mux_select(u8 ch) {
+    u8 v = (u8)(1u << ch);
+    int s = XIicPs_MasterSendPolled(&PmIic, &v, 1, PM_MUX_ADDR);
+    while (XIicPs_BusIsBusy(&PmIic));
+    return s;
+}
+
+// Set the register/command pointer, then read n bytes (separate transactions; INA226 and
+// PMBus both accept pointer-set followed by a read).
+static int pm_read_regs(u8 dev, u8 reg, u8 *buf, int n) {
+    if (XIicPs_MasterSendPolled(&PmIic, &reg, 1, dev) != XST_SUCCESS) return XST_FAILURE;
+    while (XIicPs_BusIsBusy(&PmIic));
+    if (XIicPs_MasterRecvPolled(&PmIic, buf, n, dev) != XST_SUCCESS) return XST_FAILURE;
+    while (XIicPs_BusIsBusy(&PmIic));
+    return XST_SUCCESS;
+}
+
+// INA226 (MSB-first regs): 0x02 bus voltage 1.25 mV/LSB, 0x01 shunt voltage 2.5 uV/LSB signed.
+static int pm_read_ina226(float *vbus, float *pwr) {
+    u8 b[2];
+    if (pm_mux_select(PM_INA226_CH) != XST_SUCCESS) return XST_FAILURE;
+    if (pm_read_regs(PM_INA226_ADDR, 0x02, b, 2) != XST_SUCCESS) return XST_FAILURE;
+    float vb = (float)((u16)((b[0] << 8) | b[1])) * 1.25e-3f;
+    if (pm_read_regs(PM_INA226_ADDR, 0x01, b, 2) != XST_SUCCESS) return XST_FAILURE;
+    float vsh = (float)((int16_t)((b[0] << 8) | b[1])) * 2.5e-6f;
+    *vbus = vb;
+    *pwr = vb * (vsh / PM_INA226_RSHUNT_OHM);
+    return XST_SUCCESS;
+}
+
+// PMBus LINEAR11 (LSB-first word): Y = signed 11-bit mantissa, N = signed 5-bit exponent.
+static float pm_linear11(u16 w) {
+    int16_t y = (int16_t)(w & 0x7FF);
+    if (y & 0x400) y -= 0x800;
+    int n = (int)(w >> 11);
+    if (n & 0x10) n -= 0x20;
+    return (float)y * pm_pow2(n);
+}
+
+// Scan both IRPS5401 PMICs, all pages: whichever page reads Vout ~0.85 V is VCCINT (PL core).
+// PAGE=0x00, VOUT_MODE=0x20, READ_VOUT=0x8B (LINEAR16), READ_POUT=0x96 (LINEAR11).
+static void pm_scan_irps(void) {
+    u8 addrs[2] = {0x43, 0x44};
+    if (pm_mux_select(PM_IRPS_CH) != XST_SUCCESS) { xil_printf("  [pm] mux ch2 select failed\r\n"); return; }
+    for (int a = 0; a < 2; a++) {
+        u8 dev = addrs[a];
+        for (u8 page = 0; page < 5; page++) {
+            u8 pgcmd[2] = {0x00, page}, b[2];
+            if (XIicPs_MasterSendPolled(&PmIic, pgcmd, 2, dev) != XST_SUCCESS) continue;
+            while (XIicPs_BusIsBusy(&PmIic));
+            int vexp = -12;
+            if (pm_read_regs(dev, 0x20, b, 1) == XST_SUCCESS) {
+                vexp = (int)(b[0] & 0x1F);
+                if (vexp & 0x10) vexp -= 0x20;
+            }
+            float vout = 0.0f, pout = 0.0f;
+            if (pm_read_regs(dev, 0x8B, b, 2) == XST_SUCCESS)
+                vout = (float)((u16)((b[1] << 8) | b[0])) * pm_pow2(vexp);
+            if (pm_read_regs(dev, 0x96, b, 2) == XST_SUCCESS)
+                pout = pm_linear11((u16)((b[1] << 8) | b[0]));
+            xil_printf("  [pm] IRPS 0x%02x page %d: Vout=", dev, page);
+            print_float(vout); xil_printf(" V  Pout=");
+            print_float(pout); xil_printf(" W");
+            if (vout > 0.7f && vout < 1.0f) xil_printf("   <-- ~VCCINT (PL core)");
+            xil_printf("\r\n");
+        }
+    }
+}
+
+static void pm_report(const char *tag) {
+    float vbus = 0.0f, ptot = 0.0f;
+    xil_printf("==== POWER [%s] ====\r\n", tag);
+    if (pm_read_ina226(&vbus, &ptot) == XST_SUCCESS) {
+        xil_printf("  [pm] INA226 12V: Vbus="); print_float(vbus);
+        xil_printf(" V  Pboard(total)="); print_float(ptot); xil_printf(" W\r\n");
+    } else {
+        xil_printf("  [pm] INA226 read failed (PS I2C1/mux not reachable?)\r\n");
+    }
+    pm_scan_irps();
+}
+#endif  // MEASURE_POWER
+
+
+int main() {
+    int correct = 0, tested = 0;
+    XTime t_start, t_end;
+    u64 total_ticks = 0;
+
+    // UART must come up before any xil_printf, else the banner prints to a dead UART.
+    if (init_uart() != XST_SUCCESS) return XST_FAILURE;
+
+    xil_printf("\r\n");
+    xil_printf("  SNN Streaming Inference (SD: %s)\r\n", SD_DATA_DIR);
+    xil_printf("  Samples:   %d\r\n", NUM_SAMPLES);
+    xil_printf("  Input:     %d values\r\n", ENCODED_SIZE);
+    xil_printf("  Output:    %d classes\r\n", OUTPUT_SIZE);
+    xil_printf("  Timesteps: %d\r\n", TIMESTEPS);
+    xil_printf("  Pipeline:  {{ num_stages }} stages (streaming)\r\n");
+    if (init_gpio() != XST_SUCCESS) return XST_FAILURE;
+    if (mount_sd()  != XST_SUCCESS) return XST_FAILURE;
+    if (load_labels(SD_LABEL_FILE, labels, NUM_SAMPLES) != XST_SUCCESS) return XST_FAILURE;
+
+    // Initialize all stage IPs
+{% for sidx in range(num_stages) %}
+    XStage{{ sidx }} stage{{ sidx }};
+    if (XStage{{ sidx }}_Initialize(&stage{{ sidx }}, XPAR_STAGE{{ sidx }}_0_DEVICE_ID) != XST_SUCCESS) {
+        xil_printf("[Error] Stage{{ sidx }} init failed!\r\n");
+        return XST_FAILURE;
+    }
+{% endfor %}
+    xil_printf("All {{ num_stages }} stage IPs initialized.\r\n\r\n");
+
+#ifdef MEASURE_POWER
+    if (pm_iic_init() == XST_SUCCESS) pm_report("IDLE (before inference)");
+    else xil_printf("[pm] I2C init failed; power monitoring disabled.\r\n");
+#endif
+
+    // fall file(s) are opened lazily by load_sample (handles both single and split files).
+
+    xil_printf("Starting streaming inference...\r\n\r\n");
+
+    // Checkpoint roughly 10 times across the run.
+    int print_every = (END_SAMPLE - START_SAMPLE) / 10;
+    if (print_every < 1) print_every = 1;
+
+    for (int i = START_SAMPLE; i < END_SAMPLE; i++) {
+        if (load_sample(i) != XST_SUCCESS) continue;
+
+#if USE_FIXED
+        for (int j = 0; j < ENCODED_SIZE; j++)
+            input_buf[j] = float_to_fixed_input(sd_read_buf[j]);
+#else
+        memcpy(input_buf, sd_read_buf, ENCODED_BYTES);
+#endif
+        memset(output_buf, 0, sizeof(output_buf));
+
+        Xil_DCacheFlushRange((UINTPTR)input_buf,  ENCODED_SIZE * sizeof(axi_input_t));
+        Xil_DCacheFlushRange((UINTPTR)output_buf,  OUTPUT_SIZE * sizeof(axi_output_t));
+
+        // Set DDR addresses: FIRST reads input, LAST writes output
+        XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR)input_buf);
+        XStage{{ num_stages - 1 }}_Set_ddr_output(&stage{{ num_stages - 1 }}, (u64)(UINTPTR)output_buf);
+
+        // Start ALL stages,  self-synchronize via AXI-Stream
+        XTime_GetTime(&t_start);
+{% for sidx in range(num_stages) %}
+        XStage{{ sidx }}_Start(&stage{{ sidx }});
+{% endfor %}
+
+        // Wait for LAST stage to finish
+        while (!XStage{{ num_stages - 1 }}_IsDone(&stage{{ num_stages - 1 }}));
+        XTime_GetTime(&t_end);
+
+        Xil_DCacheInvalidateRange((UINTPTR)output_buf, OUTPUT_SIZE * sizeof(axi_output_t));
+
+        int predicted;
+#if USE_FIXED
+        predicted = argmax_fixed(output_buf, OUTPUT_SIZE);
+#else
+        predicted = argmax_float((float *)output_buf, OUTPUT_SIZE);
+#endif
+
+        int label = labels[i];
+        if (predicted == label) correct++;
+        tested++;
+        show_class_on_led(predicted);
+        u64 dt = t_end - t_start;
+        total_ticks += dt;
+
+        // Per-sample line
+        xil_printf("[%d] predict=%d label=%d %s\r\n",
+                   i, predicted, label, (predicted == label) ? "CORRECT" : "WRONG");
+
+        if ((tested % print_every) == 0) {
+            float acc = 100.0f * correct / tested;
+            xil_printf("[%d/%d] acc=", tested, END_SAMPLE - START_SAMPLE);
+            print_float(acc);
+            xil_printf("%%\r\n");
+        }
+    }
+
+    if (fall_open_idx >= 0) f_close(&fall_fil);
+
+    float final_acc = 100.0f * correct / tested;
+    float ms_per_tick = 1000.0f / (float)COUNTS_PER_SECOND;
+    float avg_latency_ms = (float)total_ticks / tested * ms_per_tick;
+
+    xil_printf("  [RESULT] %d/%d correct  acc=", correct, tested);
+    print_float(final_acc);
+    xil_printf("%%  avg_latency=");
+    print_float(avg_latency_ms);
+    xil_printf("ms\r\n");
+
+#ifdef MEASURE_POWER
+    // Sustained-load power: keep the PL busy on one preloaded sample and print rails
+    // periodically. Record the steady-state LOAD reading, subtract the IDLE baseline above
+    // for PL dynamic power. Reset the board to stop.
+    xil_printf("\r\n==== Sustained-load power measurement (reset board to stop) ====\r\n");
+    if (load_sample(0) == XST_SUCCESS) {
+#if USE_FIXED
+        for (int j = 0; j < ENCODED_SIZE; j++) input_buf[j] = float_to_fixed_input(sd_read_buf[j]);
+#else
+        memcpy(input_buf, sd_read_buf, ENCODED_BYTES);
+#endif
+        Xil_DCacheFlushRange((UINTPTR)input_buf, ENCODED_SIZE * sizeof(axi_input_t));
+        XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR)input_buf);
+        XStage{{ num_stages - 1 }}_Set_ddr_output(&stage{{ num_stages - 1 }}, (u64)(UINTPTR)output_buf);
+    }
+    for (u32 rep = 0; rep <= 10000u; rep++) {
+{% for sidx in range(num_stages) %}
+        XStage{{ sidx }}_Start(&stage{{ sidx }});
+{% endfor %}
+        while (!XStage{{ num_stages - 1 }}_IsDone(&stage{{ num_stages - 1 }}));
+        if ((rep % 2000u) == 0u) pm_report("LOAD");
+    }
+    pm_report("LOAD (final)");
+#endif
+
+    return 0;
+}

@@ -1,0 +1,148 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// {{ "Max" if pool_type is defined and pool_type == "max" else "Average" }} Pooling Layer {{ index }}
+#include "pool_layer{{ index }}.h"
+#include <stddef.h>
+#include <stdint.h>
+
+{% if use_fixed %}
+// Fixed-point mode
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_ufixed<16, 1, AP_TRN, AP_SAT> data_narrow_t;
+{% if not (pool_type is defined and pool_type == "max") %}
+typedef ap_fixed<{{ layer.acc_width|default(fixed_config.width * 2) }}, {{ layer.acc_int|default(fixed_config.int * 2) }}, AP_TRN, AP_SAT> acc_t;
+{% endif %}
+typedef ap_uint<1> spike_t;
+#else
+typedef float data_t;
+typedef float data_narrow_t;
+{% if not (pool_type is defined and pool_type == "max") %}
+typedef double acc_t;
+{% endif %}
+typedef uint8_t spike_t;
+#endif
+{% else %}
+// Float mode
+typedef float data_t;
+typedef float data_narrow_t;
+typedef double acc_t;
+{% endif %}
+
+void pool_layer{{ index }}(
+{% if use_fixed and input_is_spike is defined and input_is_spike and pool_type is defined and pool_type == "max" %}
+    spike_t out[{{ layer.out_dim }}],
+    const spike_t in[{{ layer.prev_out_dim }}]
+{% elif use_fixed and input_is_spike is defined and input_is_spike %}
+    data_narrow_t out[{{ layer.out_dim }}],
+    const spike_t in[{{ layer.prev_out_dim }}]
+{% elif use_fixed and layer.input_is_narrow_data is defined and layer.input_is_narrow_data %}
+    data_narrow_t out[{{ layer.out_dim }}],
+    const data_narrow_t in[{{ layer.prev_out_dim }}]
+{% else %}
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}]
+{% endif %}
+) {
+#pragma HLS INLINE off
+
+    const int C  = {{ layer.channels }};
+    const int IH = {{ layer.in_h }};
+    const int IW = {{ layer.in_w }};
+    const int OH = {{ layer.out_h }};
+    const int OW = {{ layer.out_w }};
+    const int K  = {{ layer.kernel_size }};
+    const int S  = {{ layer.stride }};
+
+    for (int c = 0; c < C; c++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+#pragma HLS DEPENDENCE variable=out inter false
+{% endif %}
+{% if pool_type is defined and pool_type == "max" %}
+{% if use_fixed and input_is_spike is defined and input_is_spike %}
+                spike_t max_val = in[c * IH * IW + (oh * S) * IW + (ow * S)];
+                for (int kh = 0; kh < K; kh++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                    for (int kw = 0; kw < K; kw++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                        int ih = oh * S + kh;
+                        int iw = ow * S + kw;
+                        int in_idx = c * IH * IW + ih * IW + iw;
+                        spike_t val = in[in_idx];
+                        if (val > max_val) max_val = val;
+                    }
+                }
+                out[c * OH * OW + oh * OW + ow] = max_val;
+{% else %}
+{% set mt = "data_narrow_t" if (use_fixed and layer.input_is_narrow_data is defined and layer.input_is_narrow_data) else "data_t" %}
+                {{ mt }} max_val = in[c * IH * IW + (oh * S) * IW + (ow * S)];
+                for (int kh = 0; kh < K; kh++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                    for (int kw = 0; kw < K; kw++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                        int ih = oh * S + kh;
+                        int iw = ow * S + kw;
+                        int in_idx = c * IH * IW + ih * IW + iw;
+                        {{ mt }} val = in[in_idx];
+                        if (val > max_val) max_val = val;
+                    }
+                }
+                out[c * OH * OW + oh * OW + ow] = max_val;
+{% endif %}
+{% else %}
+                acc_t sum = 0;
+                for (int kh = 0; kh < K; kh++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                    for (int kw = 0; kw < K; kw++) {
+{% if use_pragma and "conv_kernel" in opt_tags %}
+#pragma HLS UNROLL
+{% endif %}
+                        int ih = oh * S + kh;
+                        int iw = ow * S + kw;
+                        int in_idx = c * IH * IW + ih * IW + iw;
+                        sum += (acc_t)in[in_idx];
+                    }
+                }
+                // Multiply by 1/(K*K) rather than divide: ap_fixed division truncates toward zero and would zero out small sums.
+{% if use_fixed and ((input_is_spike is defined and input_is_spike) or (layer.input_is_narrow_data is defined and layer.input_is_narrow_data)) %}
+                const data_narrow_t inv_kernel_area = (data_narrow_t)(1.0 / (double)(K * K));
+                out[c * OH * OW + oh * OW + ow] = (data_narrow_t)(sum * (acc_t)inv_kernel_area);
+{% else %}
+                const data_t inv_kernel_area = (data_t)(1.0 / (double)(K * K));
+                out[c * OH * OW + oh * OW + ow] = (data_t)(sum * (acc_t)inv_kernel_area);
+{% endif %}
+{% endif %}
+            }
+        }
+    }
+}

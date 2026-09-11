@@ -1,0 +1,51 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+#ifndef MODEL_H
+#define MODEL_H
+
+#define TIMESTEPS {{ timesteps }}
+#define OUTPUT_DIM {{ output_dim }}
+
+// SD card data path prefix (for main_sd.c)
+#define SD_DATA_DIR "0:/{{ sd_data_dir }}"
+#define SD_NUM_SAMPLES {{ sd_num_samples }}
+
+// Flattened input dimension
+#define INPUT_DIM_FLAT {{ input_dim_flat }}
+#define INPUT_DIM INPUT_DIM_FLAT
+
+{% if input_c is not none %}
+// If C/H/W exist, expose them
+#define INPUT_C {{ input_c }}
+#define INPUT_H {{ input_h }}
+#define INPUT_W {{ input_w }}
+{% endif %}
+
+#define NUM_LIF {{ num_lif_layers }}
+
+// Bambu backend: BRAM-buffered AXI wrapper
+#define BAMBU_BRAM_MODE 1
+
+// Bambu backend
+typedef float input_t;
+typedef float output_t;
+
+// Top-level inference function
+void inference(const float *input, float *output);
+
+#endif // MODEL_H

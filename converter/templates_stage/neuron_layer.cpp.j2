@@ -1,0 +1,130 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+// Neuron layer {{ index }} with {{ layer.reset_mechanism|default('subtract') }} reset.
+#include "neuron_layer{{ index }}.h"
+#include <stddef.h>
+
+{% if use_fixed %}
+// Fixed-point mode
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_fixed.h>
+#include <ap_int.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+{% if layer.lif_mem_narrow|default(False) %}
+typedef ap_fixed<{{ layer.lif_mem_width }}, {{ layer.lif_mem_int }}, AP_TRN, AP_SAT> lif_mem_t_{{ index }};
+{% else %}
+typedef data_t lif_mem_t_{{ index }};
+{% endif %}
+typedef ap_uint<1> spike_t;
+#else
+#include <stdint.h>
+typedef float data_t;
+typedef float lif_mem_t_{{ index }};
+typedef uint8_t spike_t;
+#endif
+{% else %}
+// Float mode
+typedef float data_t;
+typedef float lif_mem_t_{{ index }};
+{% endif %}
+
+void neuron_layer{{ index }}(
+{% if use_fixed %}
+    spike_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}],
+    lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
+    spike_t spk[{{ layer.out_dim }}],
+    data_t reset[{{ layer.out_dim }}],
+{% else %}
+    data_t out[{{ layer.out_dim }}],
+    const data_t in[{{ layer.prev_out_dim }}],
+    lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
+    data_t spk[{{ layer.out_dim }}],
+    data_t reset[{{ layer.out_dim }}],
+{% endif %}
+    data_t beta,
+    data_t v_th
+){
+    (void)reset;  // Only subtract mode uses reset[]; suppress unused-param in zero mode
+    for (size_t i = 0; i < {{ layer.out_dim }}; ++i) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% if use_fixed %}
+#pragma HLS DEPENDENCE variable=mem inter false
+{% if layer.reset_mechanism|default('subtract') != 'zero' %}
+#pragma HLS DEPENDENCE variable=reset inter false
+{% endif %}
+#pragma HLS DEPENDENCE variable=spk inter false
+{% endif %}
+{% endif %}
+{% if layer.reset_mechanism|default('subtract') == 'zero' %}
+        // Hard reset (snntorch reset_mechanism="zero"): V_mem goes to 0 immediately on spike
+{% if bit_shift_beta and beta_shift_k %}
+        // Bit-shift leak: the shift is only valid on ap_fixed (synth/csim); the GCC float path keeps the multiply
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+        data_t m = ((data_t)mem[i] - ((data_t)mem[i] >> {{ beta_shift_k }})) + in[i];
+#else
+        data_t m = beta * (data_t)mem[i] + in[i];
+#endif
+{% elif bit_shift_beta %}
+        data_t m = (data_t)mem[i] + in[i];  // beta ~= 1: no leak
+{% else %}
+        data_t m = beta * (data_t)mem[i] + in[i];
+{% endif %}
+{% if use_fixed %}
+        spike_t s = (m > v_th) ? (spike_t)1 : (spike_t)0;
+        spk[i]   = s;
+        out[i]   = s;
+        mem[i]   = (lif_mem_t_{{ index }})(s ? (data_t)0 : m);
+{% else %}
+        data_t s = (m > v_th) ? ((data_t)1) : ((data_t)0);
+        spk[i]   = s;
+        out[i]   = s;
+        mem[i]   = (s != (data_t)0) ? (lif_mem_t_{{ index }})0 : (lif_mem_t_{{ index }})m;
+{% endif %}
+{% else %}
+        // Delayed-subtract reset (snntorch reset_mechanism="subtract").
+{% if bit_shift_beta and beta_shift_k %}
+        // Bit-shift leak: the shift is only valid on ap_fixed (synth/csim); the GCC float path keeps the multiply.
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+        data_t m = ((data_t)mem[i] - ((data_t)mem[i] >> {{ beta_shift_k }})) + in[i] - reset[i];
+#else
+        data_t m = beta * (data_t)mem[i] + in[i] - reset[i];
+#endif
+{% elif bit_shift_beta %}
+        data_t m = (data_t)mem[i] + in[i] - reset[i];  // beta ~= 1: no leak
+{% else %}
+        data_t m = beta * (data_t)mem[i] + in[i] - reset[i];
+{% endif %}
+{% if use_fixed %}
+        spike_t s = (m > v_th) ? (spike_t)1 : (spike_t)0;
+        spk[i]   = s;
+        out[i]   = s;
+        mem[i]   = (lif_mem_t_{{ index }})m;
+        // reset = spike * v_th, but spike is 0/1 so a select avoids a multiply (a DSP when v_th is an arbitrary constant).
+        reset[i] = s ? v_th : (data_t)0;
+{% else %}
+        data_t s = (m > v_th) ? ((data_t)1) : ((data_t)0);
+        spk[i]   = s;
+        out[i]   = s;
+        mem[i]   = (lif_mem_t_{{ index }})m;
+        reset[i] = (s != (data_t)0) ? v_th : (data_t)0;
+{% endif %}
+{% endif %}
+    }
+}

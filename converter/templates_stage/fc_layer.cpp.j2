@@ -1,0 +1,391 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+{#- dq(acc): dequant of the accumulator. Folded mode drops the weight_scale multiply
+    (the LIF compares against v_th/weight_scale instead); otherwise the usual acc*weight_scale. -#}
+{%- macro dq(acc) -%}{% if fold_dequant %}(data_t)({{ acc }}){% else %}(data_t)({{ acc }} * weight_scale){% endif %}{%- endmacro -%}
+// Fully Connected Layer {{ index }}
+#include "fc_layer{{ index }}.h"
+#include "weights{{ layer.pair_idx }}.h"
+{% if layer.bias %}
+#include "biases{{ layer.pair_idx }}.h"
+{% endif %}
+#include <stddef.h>
+#include <stdint.h>
+
+{% if use_fixed %}
+// Fixed-point mode
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+#include <ap_int.h>
+#include <ap_fixed.h>
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_ufixed<16, 1, AP_TRN, AP_SAT> data_narrow_t;  // for AvgPool->FC paths
+typedef ap_uint<1> spike_t;
+{% if quant_weight %}
+typedef ap_int<{{ quant_weight.bit_width }}> w_t;
+// Per-layer precision sized for this layer's own weight and bias scales.
+typedef ap_fixed<{{ layer.scale_width|default(scale_config.width) }}, {{ layer.scale_int|default(scale_config.int) }}, AP_TRN, AP_SAT> scale_t;
+{% else %}
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> w_t;
+typedef data_t scale_t;
+{% endif %}
+// Per-layer MAC accumulator sized to log2(N_MAC * max_w * max_in) + sign + frac bits.
+typedef ap_fixed<{{ layer.acc_width|default(fixed_config.width * 2) }}, {{ layer.acc_int|default(fixed_config.int * 2) }}, AP_TRN, AP_SAT> acc_t;
+#else
+typedef float data_t;
+typedef float data_narrow_t;
+typedef uint8_t spike_t;
+{% if quant_weight %}
+typedef int32_t w_t;
+{% else %}
+typedef float w_t;
+{% endif %}
+typedef double acc_t;
+typedef double scale_t;
+#endif
+{% else %}
+// Float mode
+typedef float data_t;
+typedef float data_narrow_t;
+{% if quant_weight %}
+typedef int32_t w_t;
+{% else %}
+typedef float w_t;
+{% endif %}
+typedef float acc_t;   // float accumulator: avoids dadd timing violation in HLS
+{% endif %}
+
+{% if use_pragma and layer.prev_out_dim > 256 %}
+// Parallelization factor (configurable via --parallel-factor)
+#define FC{{ index }}_PARALLEL {{ parallel_factor }}
+{% endif %}
+
+{% set wsplit = layer.get('_weight_split_chunks', 0) %}
+{% if wsplit > 1 %}
+// Weight array split into {{ wsplit }} chunks, accessed via weights{{ layer.pair_idx }}_get(o, i).
+#define W{{ layer.pair_idx }}(o, i) weights{{ layer.pair_idx }}_get(o, i)
+{% else %}
+#define W{{ layer.pair_idx }}(o, i) weights{{ layer.pair_idx }}[o][i]
+{% endif %}
+
+void fc_layer{{ index }}(
+    data_t out[{{ layer.out_dim }}],
+{% if use_fixed and input_is_spike %}
+    const spike_t in[{{ layer.prev_out_dim }}]
+{% elif use_fixed and layer.input_is_narrow_data is defined and layer.input_is_narrow_data %}
+    const data_narrow_t in[{{ layer.prev_out_dim }}]
+{% else %}
+    const data_t in[{{ layer.prev_out_dim }}]
+{% endif %}
+) {
+#pragma HLS INLINE off
+{% if use_pragma %}
+{% if wsplit <= 1 %}
+{% if use_sparse and layer.prev_out_dim > 256 %}
+    // Sparse: partition weights on the output dim for output-parallel access.
+    // factor capped at out_dim so cyclic partition never exceeds the array (HLS 200-908).
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} cyclic factor={{ [parallel_factor | default(8), layer.out_dim] | min }} dim=1
+{% elif layer.prev_out_dim > 256 %}
+#pragma HLS ARRAY_PARTITION variable=in cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=1
+{% if use_fixed %}
+#pragma HLS ARRAY_RESHAPE variable=weights{{ layer.pair_idx }} cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=2
+{% else %}
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=2
+{% endif %}
+{% endif %}
+{% else %}
+    // Partition each weight chunk the same way the non-split path partitions the whole array. 
+    //The chunk getter is inlined, so HLS banks each chunk for output-parallel access. 
+    //Without this the split path emitted no weight partition and HLS built large access muxes, blowing up LUTs on big FC layers.
+{% if use_sparse and layer.prev_out_dim > 256 %}
+{% set chunk_size = (layer.out_dim + wsplit - 1) // wsplit %}
+{% for c in range(wsplit) %}
+    // factor capped at THIS chunk's own row count, not the first chunk's: out_dim rarely divides evenly, 
+    // so the last chunk is short (11 outputs over 2 chunks is 6 + 5) and a factor sized for the first one overruns it (HLS 200-908).
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }}_{{ c }} cyclic factor={{ [parallel_factor | default(8), chunk_size, layer.out_dim - c * chunk_size] | min }} dim=1
+{% endfor %}
+{% elif layer.prev_out_dim > 256 %}
+#pragma HLS ARRAY_PARTITION variable=in cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=1
+{% for c in range(wsplit) %}
+{% if use_fixed %}
+#pragma HLS ARRAY_RESHAPE variable=weights{{ layer.pair_idx }}_{{ c }} cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=2
+{% else %}
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }}_{{ c }} cyclic factor={{ [parallel_factor | default(8), layer.prev_out_dim] | min }} dim=2
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endif %}
+
+{% if use_sparse %}
+    // Pre-scan input to build a compact index of active spikes, shrinking the MAC trip count from IN to num_nonzero.
+    int spike_idx[{{ layer.prev_out_dim }}];
+    int num_nonzero = 0;
+    FC{{ index }}_BUILD_IDX:
+    for (int i = 0; i < {{ layer.prev_out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% endif %}
+        if (in[i]) {
+            spike_idx[num_nonzero++] = i;
+        }
+    }
+
+{% if quant_weight %}
+    // Quantized weights: scale applied after accumulation
+{% if not fold_dequant %}
+    const scale_t weight_scale = ((scale_t)({{ quant_weight.scale }}));
+{% endif %}
+{% if quant_bias %}
+    const scale_t bias_scale = ((scale_t)({{ quant_bias.scale }}));
+    const int bias_zero_point = {{ quant_bias.zero_point }};
+    // Bias dequant precomputed in Python double; see conv_layer for the precision rationale
+    const data_t bias_dequant_table[{{ layer.out_dim }}] = {
+{% for v in bias_dequant_table %}
+        ((data_t){{ "%.17g" | format(v) }}),
+{% endfor %}
+    };
+{% endif %}
+
+{% if use_pragma and layer.prev_out_dim > 256 %}
+    // Output-parallel sparse MAC: process FC_PARALLEL outputs per active spike
+    FC{{ index }}_SPARSE_OUT:
+    for (int o_base = 0; o_base < {{ layer.out_dim }}; o_base += FC{{ index }}_PARALLEL) {
+        acc_t acc_chunk[FC{{ index }}_PARALLEL];
+#pragma HLS ARRAY_PARTITION variable=acc_chunk complete dim=1
+        for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+            acc_chunk[p] = 0;
+        }
+
+        FC{{ index }}_SPARSE_MAC:
+        for (int s = 0; s < num_nonzero; s++) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=0 max={{ layer.prev_out_dim }} avg={{ (layer.prev_out_dim * 0.2)|int }}
+            int idx = spike_idx[s];
+            for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+                if (o_base + p < {{ layer.out_dim }}) {
+{% if input_is_spike %}
+                    acc_chunk[p] += (acc_t)W{{ layer.pair_idx }}(o_base + p, idx);
+{% else %}
+                    acc_chunk[p] += (acc_t)W{{ layer.pair_idx }}(o_base + p, idx) * (acc_t)in[idx];
+{% endif %}
+                }
+            }
+        }
+
+        for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+            if (o_base + p < {{ layer.out_dim }}) {
+{% if quant_bias %}
+                data_t bias_dequant = bias_dequant_table[o_base + p];
+                out[o_base + p] = {{ dq("acc_chunk[p]") }} + bias_dequant;
+{% else %}
+                out[o_base + p] = {{ dq("acc_chunk[p]") }};
+{% endif %}
+            }
+        }
+    }
+{% else %}
+    // Sequential sparse MAC: for each output, iterate only over active spikes
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        FC{{ index }}_SPARSE_MAC:
+        for (int s = 0; s < num_nonzero; s++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=0 max={{ layer.prev_out_dim }} avg={{ (layer.prev_out_dim * 0.2)|int }}
+{% endif %}
+{% if input_is_spike %}
+            acc += (acc_t)W{{ layer.pair_idx }}(o, spike_idx[s]);
+{% else %}
+            acc += (acc_t)W{{ layer.pair_idx }}(o, spike_idx[s]) * (acc_t)in[spike_idx[s]];
+{% endif %}
+        }
+{% if quant_bias %}
+        data_t bias_dequant = bias_dequant_table[o];
+        out[o] = {{ dq("acc") }} + bias_dequant;
+{% else %}
+        out[o] = {{ dq("acc") }};
+{% endif %}
+    }
+{% endif %}
+
+{% else %}
+    // Non-quantized sparse MAC
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+{% if layer.bias %}
+        acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[o]));
+{% else %}
+        acc_t acc = 0;
+{% endif %}
+        FC{{ index }}_SPARSE_MAC:
+        for (int s = 0; s < num_nonzero; s++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=0 max={{ layer.prev_out_dim }} avg={{ (layer.prev_out_dim * 0.2)|int }}
+{% endif %}
+{% if input_is_spike %}
+            acc += (acc_t)W{{ layer.pair_idx }}(o, spike_idx[s]);
+{% else %}
+            acc += (acc_t)W{{ layer.pair_idx }}(o, spike_idx[s]) * (acc_t)in[spike_idx[s]];
+{% endif %}
+        }
+        out[o] = (data_t)acc;
+    }
+{% endif %}
+
+{% else %}
+    // Dense path.
+{% if quant_weight %}
+    // Quantized weights: scale applied after accumulation. scale_t carries higher precision so small values are not truncated to 0.
+{% if not fold_dequant %}
+    const scale_t weight_scale = ((scale_t)({{ quant_weight.scale }}));
+{% endif %}
+{% if quant_bias %}
+    const scale_t bias_scale = ((scale_t)({{ quant_bias.scale }}));
+    const int bias_zero_point = {{ quant_bias.zero_point }};
+    // Bias dequant precomputed in Python double; see conv_layer for the precision rationale.
+    const data_t bias_dequant_table[{{ layer.out_dim }}] = {
+{% for v in bias_dequant_table %}
+        ((data_t){{ "%.17g" | format(v) }}),
+{% endfor %}
+    };
+{% endif %}
+
+{% if use_pragma and layer.prev_out_dim > 256 %}
+    // Parallelized version for large layers
+    FC{{ index }}_OUT_LOOP:
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc_partial[FC{{ index }}_PARALLEL];
+#pragma HLS ARRAY_PARTITION variable=acc_partial complete dim=1
+
+        for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+            acc_partial[p] = 0;
+        }
+
+        FC{{ index }}_MAC_LOOP:
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i += FC{{ index }}_PARALLEL) {
+#pragma HLS PIPELINE II=1
+{% if wsplit <= 1 %}
+#pragma HLS DEPENDENCE variable=weights{{ layer.pair_idx }} inter false
+{% endif %}
+            for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+                size_t idx = i + p;
+                if (idx < {{ layer.prev_out_dim }}) {
+{% if input_is_spike %}
+                    acc_partial[p] += in[idx] ? (acc_t)W{{ layer.pair_idx }}(o, idx) : (acc_t)0;
+{% else %}
+                    w_t weight_int = W{{ layer.pair_idx }}(o, idx);
+                    acc_partial[p] += (acc_t)weight_int * (acc_t)in[idx];
+{% endif %}
+                }
+            }
+        }
+
+        acc_t acc = 0;
+        for (int p = 0; p < FC{{ index }}_PARALLEL; p++) {
+#pragma HLS UNROLL
+            acc += acc_partial[p];
+        }
+
+{% if quant_bias %}
+        data_t bias_dequant = bias_dequant_table[o];
+        out[o] = {{ dq("acc") }} + bias_dequant;
+{% else %}
+        out[o] = {{ dq("acc") }};
+{% endif %}
+    }
+{% else %}
+    // Standard version
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+        acc_t acc = 0;
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% if wsplit <= 1 %}
+#pragma HLS DEPENDENCE variable=weights{{ layer.pair_idx }} inter false
+{% endif %}
+{% endif %}
+{% if input_is_spike %}
+            // Binary input: the multiply has nothing to scale, so it degenerates
+            // into a select. Written out rather than left to the synthesiser.
+            acc += in[i] ? (acc_t)W{{ layer.pair_idx }}(o, i) : (acc_t)0;
+{% else %}
+            w_t weight_int = W{{ layer.pair_idx }}(o, i);
+            acc += (acc_t)weight_int * (acc_t)in[i];
+{% endif %}
+        }
+{% if quant_bias %}
+        data_t bias_dequant = bias_dequant_table[o];
+        out[o] = {{ dq("acc") }} + bias_dequant;
+{% else %}
+        out[o] = {{ dq("acc") }};
+{% endif %}
+    }
+{% endif %}
+
+{% else %}
+    // Non-quantized weights
+    for (size_t o = 0; o < {{ layer.out_dim }}; o++) {
+{% if layer.bias %}
+        acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[o]));
+{% else %}
+        acc_t acc = 0;
+{% endif %}
+        for (size_t i = 0; i < {{ layer.prev_out_dim }}; i++) {
+{% if use_pragma %}
+#pragma HLS PIPELINE II=1
+{% if use_fixed %}
+{% if wsplit <= 1 %}
+#pragma HLS DEPENDENCE variable=weights{{ layer.pair_idx }} inter false
+{% endif %}
+{% endif %}
+{% endif %}
+            acc += ((acc_t)(W{{ layer.pair_idx }}(o, i))) * (acc_t)in[i];
+        }
+        out[o] = (data_t)acc;
+    }
+{% endif %}
+{% endif %}
+{% if act_quant %}
+    // Activation quantize-dequantize to match QAT training behavior.
+    {
+        const scale_t activation_scale = ((scale_t)({{ act_quant.scale }}));
+        const int activation_zero_point = {{ act_quant.zero_point }};
+        const int OUT_SIZE = {{ layer.out_dim }};
+        for (int i = 0; i < OUT_SIZE; i++) {
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+            acc_t q = (acc_t)out[i] / (acc_t)activation_scale + (acc_t)activation_zero_point;
+            int q_int = (int)q;
+            if (q_int < 0) q_int = 0;
+            if (q_int > 255) q_int = 255;
+            out[i] = (data_t)((acc_t)(q_int - activation_zero_point) * (acc_t)activation_scale);
+#else
+            double q = (double)out[i] / (double)activation_scale + (double)activation_zero_point;
+            int q_int = (int)(q + 0.5);
+            if (q_int < 0) q_int = 0;
+            if (q_int > 255) q_int = 255;
+            out[i] = (data_t)((double)(q_int - activation_zero_point) * (double)activation_scale);
+#endif
+        }
+    }
+{% endif %}
+}
