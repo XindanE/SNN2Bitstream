@@ -17,6 +17,9 @@ cache/
 xilinx/
 *.log
 
+# Custom route writes the standardized checkpoint next to the user model
+user_model/*_standardized.pth
+
 # QAT-FT derives a companion config next to the one it was given
 configs/*_qat_ft.toml
 

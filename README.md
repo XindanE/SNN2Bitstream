@@ -77,8 +77,8 @@ Deploy your own pre-trained snnTorch model. Put the model class in a Python file
 
 ```bash
 # FCN (input dim auto-detected)
-./snn2bitstream sw --custom user_model.my_model.MyFCN \
-    --weights user_model/my_fcn.pt --project myfcn --timestep 10 --dataset nmnist
+./snn2bitstream sw --custom user_model.nmnist_small.FCSNN \
+    --weights user_model/nmnist_model_fcsnn_10.pt --project myfcn --timestep 10 --dataset nmnist
 
 # CSNN (Conv2d models need --input-shape C,H,W)
 ./snn2bitstream sw --custom user_model.my_model.MyCSNN \
