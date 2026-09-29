@@ -258,6 +258,7 @@ if [[ "$CONFIG" == *"Q"* ]]; then USE_FIXED_QUANT="yes"; fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}"
+source "${ROOT_DIR}/script/lib_flow.sh"
 
 STANDARDIZED_PATH="user_model/${PROJ_NAME}_standardized.pth"
 IR_DIR="ir_output/${PROJ_NAME}"
@@ -289,6 +290,7 @@ echo "OUT_C_DIR       = ${OUT_C_DIR}"
 mkdir -p "$(dirname "${STANDARDIZED_PATH}")"
 mkdir -p "${IR_DIR}"
 mkdir -p "${OUT_C_DIR}"
+start_log "${ROOT_DIR}/${OUT_C_DIR}/sw_flow.log"
 
 # Step 1: standardize_model
 echo -e "\n[1/5] Running standardize_model ..."
@@ -296,7 +298,7 @@ STANDARDIZE_ARGS=(--model "${MODEL_CLASS}" --input "${CKPT_PATH}" --output "${ST
 if [ -n "${INPUT_SHAPE}" ]; then
     STANDARDIZE_ARGS+=(--input-shape "${INPUT_SHAPE}")
 fi
-python -m frontend.standardize_model "${STANDARDIZE_ARGS[@]}"
+run_logged python -m frontend.standardize_model "${STANDARDIZE_ARGS[@]}"
 
 # Step 2: export_ir (PTQ if fixed-point mode, no QAT)
 echo -e "\n[2/5] Running export_ir ..."
@@ -325,11 +327,11 @@ fi
 
 if [ "$USE_FIXED_QUANT" = "yes" ]; then
     echo "     Fixed-point mode: enabling ${CUSTOM_QUANT_BITS}-bit PTQ quantization"
-    python "${ROOT_DIR}/frontend/export_ir.py" "${STANDARDIZED_PATH}" \
+    run_logged python "${ROOT_DIR}/frontend/export_ir.py" "${STANDARDIZED_PATH}" \
         --timesteps "${TIMESTEPS}" --out-dir "${IR_DIR}" \
         --quant-bits "${CUSTOM_QUANT_BITS}" --quant-mode int8_fixed $ENCODING_FLAG
 else
-    python "${ROOT_DIR}/frontend/export_ir.py" "${STANDARDIZED_PATH}" \
+    run_logged python "${ROOT_DIR}/frontend/export_ir.py" "${STANDARDIZED_PATH}" \
         --timesteps "${TIMESTEPS}" --out-dir "${IR_DIR}" $ENCODING_FLAG
 fi
 
@@ -342,7 +344,7 @@ fi
 echo -e "\n[3/5] Running converter (config=${CONFIG}) ..."
 CONVERTER_PROJECT_ARG=""
 if [[ -n "$USER_PROJECT" ]]; then CONVERTER_PROJECT_ARG="--project $USER_PROJECT"; fi
-python "${ROOT_DIR}/converter/converter.py" "${IR_JSON}" --config "${CONFIG}" \
+run_logged python "${ROOT_DIR}/converter/converter.py" "${IR_JSON}" --config "${CONFIG}" \
     $PARALLEL_FACTOR $UNROLL_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
     $BINARY_FLAG $MUL_FABRIC_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
@@ -362,7 +364,7 @@ else
     [[ -f "$GEN_META" ]] && CACHED_T=$(cat "$GEN_META" 2>/dev/null)
     if [[ "$DATASET_KIND" == "mnist" ]]; then
         echo "  MNIST: main_mnist.c reads raw IDX files directly."
-        python3 tools/download_data.py mnist 2>/dev/null || true
+        python3 tools/download_data.py mnist >> "$FLOW_LOG" 2>&1 || true
     elif [[ -f "${TEST_DATA_DIR}/fall.bin" && "$CACHED_T" == "$TIMESTEPS" ]]; then
         echo "  Test data already exists for T=${TIMESTEPS}: ${TEST_DATA_DIR}"
     else
@@ -370,11 +372,11 @@ else
         mkdir -p "${TEST_DATA_DIR}"
         case "$DATASET_KIND" in
             nmnist)
-                python3 tools/export_nmnist_bin.py data "${TEST_DATA_DIR}" --timesteps "$TIMESTEPS" ;;
+                run_logged python3 tools/export_nmnist_bin.py data "${TEST_DATA_DIR}" --timesteps "$TIMESTEPS" ;;
             cifar10dvs)
-                python3 tools/export_cifar10dvs_bin.py "${TEST_DATA_DIR}" --data-path data --timesteps "$TIMESTEPS" ;;
+                run_logged python3 tools/export_cifar10dvs_bin.py "${TEST_DATA_DIR}" --data-path data --timesteps "$TIMESTEPS" ;;
             dvsgesture)
-                python3 tools/export_dvsgesture_bin.py "${TEST_DATA_DIR}" --data-path data --max-frames "$TIMESTEPS" ;;
+                run_logged python3 tools/export_dvsgesture_bin.py "${TEST_DATA_DIR}" --data-path data --max-frames "$TIMESTEPS" ;;
             *)
                 echo "[Warn] no export script for dataset '${DATASET_KIND}', skipping." ;;
         esac
@@ -409,26 +411,23 @@ for f in fc_layer*.cpp neuron_layer*.cpp conv_layer*.cpp dw_conv_layer*.cpp pool
 done
 
 if [[ -z "$DATASET_KIND" || "$DATASET_KIND" != "mnist" ]]; then
-    cp -v "${ROOT_DIR}/tools/main_test.c" .
+    cp "${ROOT_DIR}/tools/main_test.c" .
     SRC_FILES="main_test.c $SRC_FILES"
-    g++ -std=c++11 -O2 -Wall -Wextra $CSIM_FLAGS -o test_full $SRC_FILES -lm || {
-        echo "!! C++ compilation failed"; exit 1
-    }
+    run_logged g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_full $SRC_FILES -lm
     if [[ -n "$DATASET_KIND" && -f "${ROOT_DIR}/test_data/${DATASET_KIND}/fall.bin" ]]; then
-        echo -e "\nRunning full inference test..."
         ./test_full "${ROOT_DIR}/test_data/${DATASET_KIND}"
+        TEST_RESULT=$(grep "\[RESULT\]" sw_test.log | tail -1)
     else
         echo "  Compiled test_full but no test data available. Run manually:"
         echo "  cd ${OUT_C_DIR} && ./test_full <path_to_fall.bin_dir>"
+        TEST_RESULT="(skipped: no test data)"
     fi
 else
-    cp -v "${ROOT_DIR}/tools/main_mnist.c" .
+    cp "${ROOT_DIR}/tools/main_mnist.c" .
     SRC_FILES="main_mnist.c $SRC_FILES"
-    g++ -std=c++11 -O2 -Wall -Wextra $CSIM_FLAGS -o test_mnist $SRC_FILES -lm || {
-        echo "!! C++ compilation failed"; exit 1
-    }
-    echo -e "\nRunning MNIST inference test (10000 samples)..."
+    run_logged g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_mnist $SRC_FILES -lm
     ./test_mnist
+    TEST_RESULT=$(grep "\[RESULT\]" sw_test.log | tail -1)
 fi
 
 popd >/dev/null
@@ -438,6 +437,30 @@ echo "  Custom-Route SW Flow Completed!"
 echo "Standardized: ${STANDARDIZED_PATH}"
 echo "IR: ${IR_JSON}"
 echo "C++ Code:  ${OUT_C_DIR}"
+echo "GCC Result: ${TEST_RESULT:-N/A}"
 
 FINAL_PROJ="${USER_PROJECT:-$PROJ_NAME}"
+
+SW_REPORT="${OUT_C_DIR}/sw_report.txt"
+{
+    echo "=== SW Flow Report ==="
+    echo "Date: $(date)"
+    echo "Project: ${FINAL_PROJ}"
+    echo "Model: ${MODEL_CLASS}"
+    echo "Weights: ${CKPT_PATH}"
+    echo "Config: ${CONFIG}"
+    if [[ "$USE_FIXED_QUANT" == "yes" ]]; then echo "Quant Method: PTQ (${CUSTOM_QUANT_BITS}-bit)"; fi
+    if [[ -n "$INPUT_SHAPE" ]]; then echo "Input Shape: ${INPUT_SHAPE}"; fi
+    if [[ -n "$SPARSE_FLAG" ]]; then echo "Sparse: enabled"; fi
+    if [[ "${CSIM_APFIXED:-0}" == "1" ]]; then echo "GCC Test: ap_fixed"; else echo "GCC Test: float"; fi
+    echo "Standardized: ${STANDARDIZED_PATH}"
+    echo "IR: ${IR_JSON}"
+    echo "C++ Code:     ${OUT_C_DIR}"
+    echo "Dataset: ${DATASET_KIND:-none} (T=${TIMESTEPS})"
+    echo "GCC Result: ${TEST_RESULT:-N/A}"
+    echo "Test Log: ${OUT_C_DIR}/sw_test.log"
+    echo "Flow Log: ${OUT_C_DIR}/sw_flow.log"
+} > "${SW_REPORT}"
+echo "SW Report: ${SW_REPORT}"
+report_warnings
 echo "$FINAL_PROJ" > "${ROOT_DIR}/.last_sw_project"

@@ -54,6 +54,7 @@ case "$PROJ_NAME" in
 esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/script/lib_flow.sh"
 
 # SNN2B_OUTPUT_DIR selects the same project directory used by code generation.
 PROJ_BASE="${SNN2B_OUTPUT_DIR:-backend_projects}"
@@ -94,24 +95,22 @@ run_bambu_flow() {
     cp "${ROOT_DIR}/tools/xinference_bambu.h" "${BAMBU_BUILD_DIR}/" 2>/dev/null || true
     cd "${BAMBU_BUILD_DIR}"
 
-    echo -e "\n[1/3] Running Bambu HLS synthesis ..."
-    bash run_bambu.sh
+    echo -e "\n[1/3] Running Bambu HLS synthesis (can take a while for large models) ..."
+    run_timed "Bambu HLS" bash run_bambu.sh
 
-    echo -e "\n[2/3] Running Vivado block design ..."
-    vivado -mode batch -source build_block_design_bambu.tcl -tclargs "${PROJ_NAME}"
+    echo -e "\n[2/3] Running Vivado block design (can take hours for large designs) ..."
+    run_timed "Vivado" vivado -mode batch -source build_block_design_bambu.tcl -tclargs "${PROJ_NAME}"
 
     local XSA_FILE="${BAMBU_BUILD_DIR}/vivado_${PROJ_NAME}_${BOARD_TAG}/${PROJ_NAME}_${BOARD_TAG}.xsa"
     if [[ ! -f "$XSA_FILE" ]]; then
-        echo "[Error] Vivado produced no XSA; the block design failed - see the log above."
-        exit 1
+        fail_with_log "Vivado produced no XSA; the block design failed."
     fi
 
     echo -e "\n[3/3] Vitis (create ELF) ..."
-    xsct run_vitis_bambu.tcl "${ROOT_DIR}/tools/main_sd.c"
+    run_timed "Vitis" xsct run_vitis_bambu.tcl "${ROOT_DIR}/tools/main_sd.c"
     local ELF_FILE="${BAMBU_BUILD_DIR}/vitis_${PROJ_NAME}/SW_${PROJ_NAME}/Debug/SW_${PROJ_NAME}.elf"
     if [[ ! -s "$ELF_FILE" ]]; then
-        echo "[Error] Vitis produced no ELF; see the build log above."
-        exit 1
+        fail_with_log "Vitis produced no ELF."
     fi
 
     echo ""
@@ -139,27 +138,25 @@ run_streaming_flow() {
     # Vitis host build reads ../model.h relative to the streaming dir.
     cp "${OUT_C_DIR}/model.h" "${XILINX_PROJ_DIR}/model.h" 2>/dev/null || true
 
-    echo -e "\n[1/3] Per-stage HLS synthesis ..."
-    bash "${ROOT_DIR}/script/run_streaming_hls.sh" "${PROJ_NAME}" "${STREAM_DIR}"
+    echo -e "\n[1/3] Per-stage HLS synthesis (can take a while for large models) ..."
+    run_timed "HLS (all stages)" bash "${ROOT_DIR}/script/run_streaming_hls.sh" "${PROJ_NAME}" "${STREAM_DIR}"
 
     # Each stage must have exported its IP before Vivado can integrate them.
     local n_stage n_ip
     n_stage=$(find "${STREAM_DIR}" -maxdepth 1 -type d -name 'stage*' | wc -l)
     n_ip=$(find "${STREAM_DIR}"/stage*/ip_export -name 'export.zip' 2>/dev/null | wc -l)
     if [[ "$n_ip" -lt "$n_stage" ]]; then
-        echo "[Error] only ${n_ip}/${n_stage} streaming stages produced IP (export.zip missing); HLS failed - see ${STREAM_DIR}/stage*/hls_log.txt"
-        exit 1
+        fail_with_log "only ${n_ip}/${n_stage} streaming stages produced IP (export.zip missing); see also ${STREAM_DIR}/stage*/hls_log.txt"
     fi
 
-    echo -e "\n[2/3] Vivado streaming integration ..."
+    echo -e "\n[2/3] Vivado streaming integration (can take hours for large designs) ..."
     cd "${STREAM_DIR}"
-    vivado -mode batch -source vivado_streaming_zcu104.tcl -tclargs "${PROJ_NAME}"
+    run_timed "Vivado" vivado -mode batch -source vivado_streaming_zcu104.tcl -tclargs "${PROJ_NAME}"
 
     local BITSTREAM
     BITSTREAM=$(find "${STREAM_DIR}" -name '*_wrapper.bit' 2>/dev/null | head -1)
     if [[ -z "$BITSTREAM" ]]; then
-        echo "[Error] Vivado produced no bitstream; streaming integration failed - see the log above."
-        exit 1
+        fail_with_log "Vivado produced no bitstream; streaming integration failed."
     fi
 
     echo -e "\n[3/3] Vitis (create ELF) ..."
@@ -167,11 +164,10 @@ run_streaming_flow() {
         echo "[Error] Streaming Vitis files missing; regenerate the project with --streaming."
         exit 1
     fi
-    xsct run_vitis_streaming.tcl "${STREAM_DIR}/main_sd_streaming.c"
+    run_timed "Vitis" xsct run_vitis_streaming.tcl "${STREAM_DIR}/main_sd_streaming.c"
     local ELF_FILE="${STREAM_DIR}/vitis_streaming/SW_streaming/Debug/SW_streaming.elf"
     if [[ ! -s "$ELF_FILE" ]]; then
-        echo "[Error] Vitis produced no ELF; see the build log above."
-        exit 1
+        fail_with_log "Vitis produced no ELF."
     fi
 
     echo ""
@@ -189,52 +185,56 @@ run_vitis_flow() {
     echo -e "\n[1/4] Copying generated code to Xilinx project ..."
     rm -f "${XILINX_SRC_DIR}"/*.c "${XILINX_SRC_DIR}"/*.cpp "${XILINX_SRC_DIR}"/*.h 2>/dev/null || true
     # Copy only .cpp and .h; .c test harnesses like main_nmnist.c break HLS.
-    cp -v "${OUT_C_DIR}"/*.cpp "${XILINX_SRC_DIR}/" 2>/dev/null || true
-    cp -v "${OUT_C_DIR}"/*.h "${XILINX_SRC_DIR}/" 2>/dev/null || true
+    cp "${OUT_C_DIR}"/*.cpp "${XILINX_SRC_DIR}/" 2>/dev/null || true
+    cp "${OUT_C_DIR}"/*.h "${XILINX_SRC_DIR}/" 2>/dev/null || true
     # Per-project HLS op directives (converter emits it only for --mul-impl-fabric);
     # goes next to run_hls_inference.tcl so the script can source it before csynth.
-    [ -f "${OUT_C_DIR}/hls_directives.tcl" ] && cp -v "${OUT_C_DIR}/hls_directives.tcl" "${XILINX_PROJ_DIR}/"
+    [ -f "${OUT_C_DIR}/hls_directives.tcl" ] && cp "${OUT_C_DIR}/hls_directives.tcl" "${XILINX_PROJ_DIR}/"
     # Copy HLS/Vivado/Vitis Tcl templates
-    cp -v "${HLS_TEMPLATE_DIR}/run_hls_inference.tcl" \
+    cp "${HLS_TEMPLATE_DIR}/run_hls_inference.tcl" \
           "${XILINX_PROJ_DIR}/run_hls_inference.tcl"
-    cp -v "${HLS_TEMPLATE_DIR}/vivado_build_inference_zcu104.tcl" \
+    cp "${HLS_TEMPLATE_DIR}/vivado_build_inference_zcu104.tcl" \
           "${XILINX_PROJ_DIR}/vivado_build_inference_zcu104.tcl"
-    cp -v "${HLS_TEMPLATE_DIR}/run_vitis_app.tcl" \
+    cp "${HLS_TEMPLATE_DIR}/run_vitis_app.tcl" \
           "${XILINX_PROJ_DIR}/run_vitis_app.tcl"
 
-    echo -e "\n[2/4] Running Vitis HLS ..."
+    echo -e "\n[2/4] Running Vitis HLS (can take a while for large models) ..."
     cd "${XILINX_PROJ_DIR}"
     # Skip csynth if the IP is already built (Vivado-only rerun): lets a timed-out-in-Vivado
     # arch redo just the Vivado flow with a fresh time budget, without re-running HLS.
-    if [[ -f "${XILINX_PROJ_DIR}/hls_ip/export.zip" ]]; then
-        echo "     hls_ip/export.zip exists - skipping Vitis HLS (Vivado-only rerun)"
+    # Compare against cpp/, not src/: src/ is re-copied on every run.
+    local HLS_IP_ZIP="${XILINX_PROJ_DIR}/hls_ip/export.zip"
+    if [[ -f "$HLS_IP_ZIP" && -n "$(find "${OUT_C_DIR}" -maxdepth 1 -newer "$HLS_IP_ZIP" \
+            \( -name '*.cpp' -o -name '*.h' -o -name 'hls_directives.tcl' \) -print -quit)" ]]; then
+        echo "     generated code is newer than hls_ip/export.zip - rebuilding the IP"
+        rm -rf "${XILINX_PROJ_DIR}/hls_ip"
+    fi
+    if [[ -f "$HLS_IP_ZIP" ]]; then
+        echo "     hls_ip/export.zip is up to date - skipping Vitis HLS (Vivado-only rerun)"
     else
-        vitis_hls -f run_hls_inference.tcl
+        run_timed "Vitis HLS" vitis_hls -f run_hls_inference.tcl
     fi
 
     # vitis_hls exits 0 even when csynth fails, so check it actually produced the IP.
     if [[ ! -f "${XILINX_PROJ_DIR}/hls_ip/export.zip" ]]; then
-        echo "[Error] Vitis HLS produced no IP (hls_ip/export.zip missing); synthesis failed - see the log above."
-        exit 1
+        fail_with_log "Vitis HLS produced no IP (hls_ip/export.zip missing); synthesis failed."
     fi
 
-    echo -e "\n[3/4] Running Vivado ..."
-    vivado -mode batch -source vivado_build_inference_zcu104.tcl -tclargs "${PROJ_NAME}"
+    echo -e "\n[3/4] Running Vivado (can take hours for large designs) ..."
+    run_timed "Vivado" vivado -mode batch -source vivado_build_inference_zcu104.tcl -tclargs "${PROJ_NAME}"
 
     local BITSTREAM XSA_FILE ELF_FILE XILINX_REPORT
     BITSTREAM="${XILINX_PROJ_DIR}/vivado_${PROJ_NAME}_${BOARD_TAG}/${PROJ_NAME}_${BOARD_TAG}.runs/impl_1/design_1_wrapper.bit"
     XSA_FILE="${XILINX_PROJ_DIR}/vivado_${PROJ_NAME}_${BOARD_TAG}/${PROJ_NAME}_${BOARD_TAG}.xsa"
     if [[ ! -f "$XSA_FILE" ]]; then
-        echo "[Error] Vivado produced no XSA; implementation failed - see the log above."
-        exit 1
+        fail_with_log "Vivado produced no XSA; implementation failed."
     fi
 
     echo -e "\n[4/4] Vitis (create ELF) ..."
-    xsct run_vitis_app.tcl "${ROOT_DIR}/tools/main_sd.c"
+    run_timed "Vitis" xsct run_vitis_app.tcl "${ROOT_DIR}/tools/main_sd.c"
     ELF_FILE="${XILINX_PROJ_DIR}/vitis_${PROJ_NAME}/SW_${PROJ_NAME}/Debug/SW_${PROJ_NAME}.elf"
     if [[ ! -s "$ELF_FILE" ]]; then
-        echo "[Error] Vitis produced no ELF; see the build log above."
-        exit 1
+        fail_with_log "Vitis produced no ELF."
     fi
 
     echo ""
@@ -267,6 +267,12 @@ echo "  SNN to Bitstream - Xilinx Flow"
 echo "PROJECT_NAME    = ${PROJ_NAME}"
 echo "OUT_C_DIR       = ${OUT_C_DIR}"
 echo "XILINX_PROJ_DIR = ${XILINX_PROJ_DIR}"
+
+start_log "${PROJ_BASE}/${PROJ_NAME}/hw_flow.log"
+
+if [[ -n "$(find "${PROJ_BASE}/${PROJ_NAME}" -name '*_wrapper.bit' -print -quit 2>/dev/null)" ]]; then
+    echo "Note: ${PROJ_NAME} already has a bitstream; it will be rebuilt (use another --project to keep it)."
+fi
 
 # Dispatch by backend: Bambu (run_bambu.sh) > streaming (streaming/) > monolithic.
 if [ -f "${OUT_C_DIR}/run_bambu.sh" ]; then

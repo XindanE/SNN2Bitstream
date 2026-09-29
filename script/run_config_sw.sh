@@ -34,6 +34,7 @@ shopt -s nullglob
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}"
+source "${ROOT_DIR}/script/lib_flow.sh"
 
 # Default config files
 CFG_FILE="configs/mnist_fcn_rate.toml"
@@ -480,6 +481,9 @@ echo "Output: $OUT_C_DIR"
 echo "Timesteps: $TIMESTEPS"
 echo "Dataset: $DATASET_KIND"
 
+mkdir -p "${OUT_C_DIR}"
+start_log "${ROOT_DIR}/${OUT_C_DIR}/sw_flow.log"
+
 # Step 1: Train model
 echo -e "\n[1/5] Training model..."
 
@@ -492,7 +496,7 @@ if [[ -n "$TOML_CKPT_OVERRIDE" ]]; then
     REAL_SRC=$(realpath "$TOML_CKPT_OVERRIDE")
     REAL_DST=$(realpath "$CKPT_PTH" 2>/dev/null || echo "")
     if [[ "$REAL_SRC" != "$REAL_DST" ]]; then
-        cp -v "$TOML_CKPT_OVERRIDE" "$CKPT_PTH"
+        cp "$TOML_CKPT_OVERRIDE" "$CKPT_PTH"
     fi
     echo "     Skipping training..."
 
@@ -502,18 +506,18 @@ elif [[ "$QUANT_METHOD" == "qat_ft" && "$USE_QUANT" -eq 1 ]]; then
         echo "     Skipping pretraining step..."
     else
         echo "     Step 1a: Pretraining FP32 model..."
-        python3 frontend/train_model.py "$CFG_FILE"
+        python3 frontend/train_model.py "$CFG_FILE" 2>&1 | tee -a "$FLOW_LOG"
     fi
     echo "     Step 1b: QAT Fine-Tuning from pretrained model..."
-    python3 frontend/train_model.py "$QAT_FT_CFG" --qat --pretrained "$PRETRAIN_CKPT"
+    python3 frontend/train_model.py "$QAT_FT_CFG" --qat --pretrained "$PRETRAIN_CKPT" 2>&1 | tee -a "$FLOW_LOG"
 
 elif [[ "$QUANT_METHOD" == "qat" && "$USE_QUANT" -eq 1 ]]; then
     if [[ -n "$USER_PRETRAINED" ]]; then
         echo "     QAT Fine-Tuning from user pretrained model: $USER_PRETRAINED"
-        python3 frontend/train_model.py "$CFG_FILE" --qat --pretrained "$USER_PRETRAINED"
+        python3 frontend/train_model.py "$CFG_FILE" --qat --pretrained "$USER_PRETRAINED" 2>&1 | tee -a "$FLOW_LOG"
     else
         echo "     Using Quantization-Aware Training (QAT) from scratch"
-        python3 frontend/train_model.py "$CFG_FILE" --qat
+        python3 frontend/train_model.py "$CFG_FILE" --qat 2>&1 | tee -a "$FLOW_LOG"
     fi
 
 elif [[ "$QUANT_METHOD" == "ptq" && "$USE_QUANT" -eq 1 ]]; then
@@ -521,10 +525,10 @@ elif [[ "$QUANT_METHOD" == "ptq" && "$USE_QUANT" -eq 1 ]]; then
         echo "     Using user pretrained model for PTQ: $USER_PRETRAINED"
         REAL_SRC=$(realpath "$USER_PRETRAINED")
         REAL_DST=$(realpath "$CKPT_PTH" 2>/dev/null || echo "")
-        if [[ "$REAL_SRC" != "$REAL_DST" ]]; then cp -v "$USER_PRETRAINED" "$CKPT_PTH"; fi
+        if [[ "$REAL_SRC" != "$REAL_DST" ]]; then cp "$USER_PRETRAINED" "$CKPT_PTH"; fi
     else
         echo "     Using standard FP32 training (for PTQ)"
-        python3 frontend/train_model.py "$CFG_FILE"
+        python3 frontend/train_model.py "$CFG_FILE" 2>&1 | tee -a "$FLOW_LOG"
     fi
 
 else
@@ -533,10 +537,10 @@ else
         echo "     Using user pretrained model: $USER_PRETRAINED"
         REAL_SRC=$(realpath "$USER_PRETRAINED")
         REAL_DST=$(realpath "$CKPT_PTH" 2>/dev/null || echo "")
-        if [[ "$REAL_SRC" != "$REAL_DST" ]]; then cp -v "$USER_PRETRAINED" "$CKPT_PTH"; fi
+        if [[ "$REAL_SRC" != "$REAL_DST" ]]; then cp "$USER_PRETRAINED" "$CKPT_PTH"; fi
     else
         echo "     Using standard FP32 training"
-        python3 frontend/train_model.py "$CFG_FILE"
+        python3 frontend/train_model.py "$CFG_FILE" 2>&1 | tee -a "$FLOW_LOG"
     fi
 fi
 
@@ -564,7 +568,7 @@ IS_BINARY_FLAG=""
 ENCODING_FLAG=""
 [[ -n "$RESOLVED_ENCODING" ]] && ENCODING_FLAG="--encoding $RESOLVED_ENCODING"
 
-python3 frontend/export_ir.py "$CKPT_PTH" \
+run_logged python3 frontend/export_ir.py "$CKPT_PTH" \
     --timesteps "$TIMESTEPS" --out-dir "$IR_DIR" \
     --quant-mode "$QUANT_MODE" $QAT_FLAG $QUANT_BITS_ARG \
     --dataset-kind "$DATASET_KIND" $IS_BINARY_FLAG $ENCODING_FLAG
@@ -602,7 +606,7 @@ case "$BACKEND" in
         ;;
 esac
 
-python3 converter/converter.py "$IR_DIR/ir.json" --config "$CONFIG" \
+run_logged python3 converter/converter.py "$IR_DIR/ir.json" --config "$CONFIG" \
     $PARALLEL_FACTOR $UNROLL_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
     $MUL_FABRIC_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
@@ -616,7 +620,7 @@ TEST_DATA_DIR="${ROOT_DIR}/test_data/${DATASET_KIND}_T${TIMESTEPS}_${INPUT_ENC_L
 
 if [[ "$DATASET_KIND" == "mnist" ]]; then
     echo "  MNIST: main_mnist.c reads raw IDX files directly."
-    python3 tools/download_data.py mnist 2>/dev/null || true
+    python3 tools/download_data.py mnist >> "$FLOW_LOG" 2>&1 || true
 else
     # Cache is keyed on timesteps AND encoding: .gen_meta records "T_encoding" so a T change
     # OR a count<->spike (binarize) change forces regeneration: same T with different encoding
@@ -633,13 +637,13 @@ else
         mkdir -p "${TEST_DATA_DIR}"
         case "$DATASET_KIND" in
             nmnist)
-                python3 tools/export_nmnist_bin.py data "${TEST_DATA_DIR}" --timesteps "$TIMESTEPS" $BIN_FLAG
+                run_logged python3 tools/export_nmnist_bin.py data "${TEST_DATA_DIR}" --timesteps "$TIMESTEPS" $BIN_FLAG
                 ;;
             cifar10dvs)
-                python3 tools/export_cifar10dvs_bin.py "${TEST_DATA_DIR}" --data-path data --timesteps "$TIMESTEPS"
+                run_logged python3 tools/export_cifar10dvs_bin.py "${TEST_DATA_DIR}" --data-path data --timesteps "$TIMESTEPS"
                 ;;
             dvsgesture)
-                python3 tools/export_dvsgesture_bin.py "${TEST_DATA_DIR}" --data-path data --max-frames "$TIMESTEPS"
+                run_logged python3 tools/export_dvsgesture_bin.py "${TEST_DATA_DIR}" --data-path data --max-frames "$TIMESTEPS"
                 ;;
             *)
                 echo "[Warn] no export script for dataset '${DATASET_KIND}', skipping test data."
@@ -677,7 +681,7 @@ if [[ "${CSIM_APFIXED:-0}" == "1" ]]; then
 fi
 
 if [[ "$DATASET_KIND" == "mnist" ]]; then
-    cp -v "tools/main_mnist.c" "$OUT_C_DIR/"
+    cp "tools/main_mnist.c" "$OUT_C_DIR/"
     pushd "$OUT_C_DIR" >/dev/null
 
     SRC_FILES="main_mnist.c model.cpp reset_node.cpp"
@@ -685,17 +689,12 @@ if [[ "$DATASET_KIND" == "mnist" ]]; then
         [ -f "$f" ] && SRC_FILES="$SRC_FILES $f"
     done
 
-    GCC_WARN_FLAGS="-Wno-unknown-pragmas -Wno-unused-label -Wno-unused-function -Wno-comment"
-    g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_mnist $SRC_FILES -lm || {
-        echo "!! C++ compilation failed"; exit 1
-    }
-    echo -e "\nRunning MNIST inference test (10000 samples)..."
-    # Keep the full test log next to the generated code for the user to inspect.
-    ./test_mnist "${ROOT_DIR}/data/MNIST" | tee sw_test.log
+    run_logged g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_mnist $SRC_FILES -lm
+    ./test_mnist "${ROOT_DIR}/data/MNIST"
     TEST_RESULT=$(grep "\[RESULT\]" sw_test.log | tail -1)
     popd >/dev/null
 else
-    cp -v "tools/main_test.c" "$OUT_C_DIR/"
+    cp "tools/main_test.c" "$OUT_C_DIR/"
     pushd "$OUT_C_DIR" >/dev/null
 
     SRC_FILES="main_test.c model.cpp reset_node.cpp"
@@ -703,19 +702,13 @@ else
         [ -f "$f" ] && SRC_FILES="$SRC_FILES $f"
     done
 
-    GCC_WARN_FLAGS="-Wno-unknown-pragmas -Wno-unused-label -Wno-unused-function -Wno-comment"
-    g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_full $SRC_FILES -lm || {
-        echo "!! C++ compilation failed"; exit 1
-    }
+    run_logged g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_full $SRC_FILES -lm
     if [[ -f "${TEST_DATA_DIR}/fall.bin" ]]; then
         if [[ -n "$MAX_SAMPLES" ]]; then
-            echo -e "\nRunning inference test (capped at ${MAX_SAMPLES} samples)..."
-        else
-            echo -e "\nRunning full inference test..."
+            echo "  Test capped at ${MAX_SAMPLES} samples"
         fi
-        # Keep the test log next to the generated code for the user to inspect.
         # argv[2] (MAX_SAMPLES) caps the sample count; empty = full set.
-        ./test_full "${TEST_DATA_DIR}" ${MAX_SAMPLES} | tee sw_test.log
+        ./test_full "${TEST_DATA_DIR}" ${MAX_SAMPLES}
         TEST_RESULT=$(grep "\[RESULT\]" sw_test.log | tail -1)
     else
         echo "[Info] No test data for '${DATASET_KIND}'; skipping the GCC accuracy test."
@@ -760,8 +753,10 @@ if [[ -n "$DATAFLOW_FLAG" ]]; then echo "Dataflow: enabled"; fi
     echo "Dataset: ${DATASET_KIND} (T=${TIMESTEPS})"
     echo "GCC Result: ${TEST_RESULT:-N/A}"
     echo "Test Log: ${OUT_C_DIR}/sw_test.log"
+    echo "Flow Log: ${OUT_C_DIR}/sw_flow.log"
 } > "${SW_REPORT}"
 echo "SW Report: ${SW_REPORT}"
+report_warnings
 
 # Append SW-flow provenance to build_information.txt (converter wrote the codegen part).
 BUILD_INFO="${PROJECT_DIR}/build_information.txt"

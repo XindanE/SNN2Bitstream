@@ -2,6 +2,8 @@
 //
 // Compile: g++ -std=c++11 -O2 model.cpp fc_layer*.cpp lif_layer*.cpp conv_layer*.cpp pool_layer*.cpp reset_node.cpp main_mnist.c -lm -o test
 // Run: ./test
+//
+// Per-sample results go to sw_test.log (or $SNN2B_TEST_LOG) in the board's UART format.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +11,7 @@
 #include <float.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>
 #include "model.h"
 
 #ifndef INPUT_DIM_FLAT
@@ -121,11 +124,18 @@ int main(int argc, char **argv) {
     float image[IMAGE_SIZE];
     output_t output[OUTPUT_DIM];
 
-    FILE *log_file = fopen("test.log", "w");
-    if (!log_file) {
-        perror("Failed to open log file");
-        return 1;
+    const char *log_env = getenv("SNN2B_TEST_LOG");
+    const char *log_path = log_env ? log_env : "sw_test.log";
+    FILE *log_file = NULL;
+    if (log_path[0] != '\0') {
+        log_file = fopen(log_path, "w");
+        if (!log_file) {
+            perror(log_path);
+            return 1;
+        }
     }
+    int on_terminal = isatty(fileno(stdout));
+    int print_every = total / 10;
 
 #if INPUT_ENCODING_REPEAT
     // Repeat encoding
@@ -142,9 +152,13 @@ int main(int argc, char **argv) {
     }
 
     printf("Running MNIST SNN C test (%d samples)...\n", total);
-    printf("  TIMESTEPS=%d, INPUT_DIM_FLAT=%d, ENCODING=%s\n\n",
+    printf("  TIMESTEPS=%d, INPUT_DIM_FLAT=%d, ENCODING=%s\n",
            (int)TIMESTEPS, (int)INPUT_DIM_FLAT,
            INPUT_ENCODING_REPEAT ? "repeat" : "rate");
+
+    struct timespec t_start, t_now;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    double last_draw_ms = -1e9;
 
     for (int image_index = 0; image_index < total; image_index++) {
         load_mnist_image(image, image_index);
@@ -175,23 +189,47 @@ int main(int argc, char **argv) {
             correct++;
         }
 
-        fprintf(log_file, "Image %d: pred=%d, true=%d, %s\n",
-                image_index, pred, true_label,
-                pred == true_label ? "correct" : "wrong");
+        int done = image_index + 1;
+        double acc = 100.0 * correct / done;
 
-        if ((image_index + 1) % 500 == 0 || image_index + 1 == total) {
-            float acc = 100.0f * correct / (image_index + 1);
-            printf("  [%5d/%5d] acc=%.2f%%\r", image_index + 1, total, acc);
+        if (log_file) {
+            fprintf(log_file, "[%d] predict=%d label=%d %s\n",
+                    image_index, pred, true_label,
+                    pred == true_label ? "CORRECT" : "WRONG");
+            if (done % print_every == 0)
+                fprintf(log_file, "[%d/%d] acc=%.4f%%\n", done, total, acc);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed_ms = (t_now.tv_sec - t_start.tv_sec) * 1000.0
+                          + (t_now.tv_nsec - t_start.tv_nsec) / 1e6;
+        if (on_terminal) {
+            if (elapsed_ms - last_draw_ms >= 100.0 || done == total) {
+                double avg_ms = elapsed_ms / done;
+                int remaining_s = (int)(avg_ms * (total - done) / 1000.0);
+                printf("\r[%d/%d] acc=%.2f%%  avg=%.3fms  ETA %dm%02ds   ",
+                       done, total, acc, avg_ms, remaining_s / 60, remaining_s % 60);
+                fflush(stdout);
+                last_draw_ms = elapsed_ms;
+            }
+        } else if (done % print_every == 0) {
+            printf("[%d/%d] acc=%.4f%%\n", done, total, acc);
             fflush(stdout);
         }
     }
-    printf("\n");
+    clock_gettime(CLOCK_MONOTONIC, &t_now);
+    double total_ms = (t_now.tv_sec - t_start.tv_sec) * 1000.0
+                    + (t_now.tv_nsec - t_start.tv_nsec) / 1e6;
+    if (on_terminal) printf("\n");
 
-    float acc = 100.0f * correct / total;
-    printf("[RESULT] Accuracy: %.2f%% (%d/%d)\n", acc, correct, total);
-
-    fprintf(log_file, "SUMMARY: Accuracy = %.2f%% (%d/%d)\n", acc, correct, total);
-    fclose(log_file);
+    double acc = 100.0 * correct / total;
+    printf("\n  [RESULT] %d/%d correct  acc=%.4f%%  avg_latency=%.4fms\n",
+           correct, total, acc, total_ms / total);
+    if (log_file) {
+        fprintf(log_file, "\n  [RESULT] %d/%d correct  acc=%.4f%%  avg_latency=%.4fms\n",
+                correct, total, acc, total_ms / total);
+        fclose(log_file);
+    }
     free(encoded_float);
     free(input_conv);
     return 0;
