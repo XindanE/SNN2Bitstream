@@ -36,7 +36,12 @@ Put them on `PATH` (source the Xilinx `settings64.sh`). The 2020.2 release also 
 
 # Hardware only, on an already-generated project
 ./snn2bitstream hw <project_name>
+
+# Zero-DSP variant: multiplies on LUTs instead of DSPs
+./snn2bitstream full --toml configs/mnist_fcn_rate.toml --mul-impl-fabric
 ```
+
+`configs/mnist_fcn_rate.toml` is a rate-coded MNIST FCSNN (784-128-10). Target board is the AMD ZCU104 (XCZU7EV Zynq UltraScale+ MPSoC) at 100 MHz.
 
 `./snn2bitstream` forwards to `script/run_all.sh`; either name works.
 
@@ -70,31 +75,24 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--project <name>` | Write the output to a separate project directory. |
 | `--input-shape C,H,W` | Input shape, required for Conv2d models on the custom route. |
 | `--input-is-binary` | Treat the input as binary spikes (custom route, rate-coded input only). |
+| `--csim-apfixed` / `--no-csim-apfixed` | GCC test with the real `ap_fixed` types (needs the Vitis HLS headers, slower). On by default for the config route, off for the custom route. |
 
 ## Custom route
 
 Deploy your own pre-trained snnTorch model. Put the model class in a Python file, e.g. `user_model/my_model.py`, and pass it as a module path together with its weights:
 
 ```bash
-# FCN (input dim auto-detected)
-./snn2bitstream sw --custom user_model.nmnist_small.FCSNN \
-    --weights user_model/nmnist_model_fcsnn_10.pt --project myfcn --timestep 10 --dataset nmnist
-
-# CSNN (Conv2d models need --input-shape C,H,W)
-./snn2bitstream sw --custom user_model.my_model.MyCSNN \
-    --weights user_model/my_csnn.pt --project mycsnn --timestep 10 \
-    --dataset nmnist --input-shape 2,34,34 --config SPQ
+# FCSNN
+./snn2bitstream full --custom user_model.nmnist_small.FCSNN \
+    --weights user_model/nmnist_model_fcsnn_10.pt --project myfcn --timestep 10 --dataset nmnist\
+    --sparse
+# CSNN
+./snn2bitstream full --custom user_model.nmnist_small.SurrogateCSNN \
+    --weights user_model/nmnist_model_csnn_10.pt --project mycsnn --timestep 10 --dataset nmnist --input-shape 2,34,34 \
+    --unroll ck --sparse --data-width 16
 ```
 
 Support for custom models is currently limited.
-
-## Examples
-
-```bash
-./snn2bitstream full --toml configs/mnist_fcn_rate.toml --mul-impl-fabric
-```
-
-Target board is the AMD ZCU104 (XCZU7EV Zynq UltraScale+ MPSoC) at 100 MHz.
 
 ## Repository layout
 
@@ -111,8 +109,9 @@ Generated output (all gitignored):
 
 | Path | Contents |
 |------|----------|
-| `backend_projects/<project>/cpp/` | generated C++, the compiled GCC test, `sw_report.txt` |
-| `backend_projects/<project>/xilinx/` | Vitis HLS + Vivado projects, `post_place_report.txt`, bitstream |
+| `backend_projects/<project>/cpp/` | generated C++, the compiled GCC test, `sw_report.txt`, `sw_test.log`, `sw_flow.log` |
+| `backend_projects/<project>/xilinx/` | Vitis HLS + Vivado projects, bitstream |
+| `backend_projects/<project>/` | `post_place_report.txt`, `hw_flow.log` |
 | `ir_output/<project>/` | `ir.json` and the weight/bias CSVs |
 | `checkpoints/` | trained checkpoints and per-run accuracy logs |
 
