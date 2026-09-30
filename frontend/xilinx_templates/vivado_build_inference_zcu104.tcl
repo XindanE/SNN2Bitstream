@@ -180,7 +180,7 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
 } [get_bd_intf_pins inference_0/s_axi_control]
 
 # 4.4 Connect AXI for inference input data: inference_0/m_axi_input_r -> S_AXI_HPC0_FPD
-# Note: This call is symmetric with what the GUI produced; the object is the PS port.
+# This call is symmetric with what the GUI produced; the object is the PS port.
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
     Clk_master {Auto} \
     Clk_slave  {Auto} \

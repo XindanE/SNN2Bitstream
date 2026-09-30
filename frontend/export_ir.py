@@ -32,7 +32,7 @@ def _round_up_4(n):
     return max(((n + 3) // 4) * 4, 4)
 
 def derive_type_config(min_val, max_val, is_integer, is_signed, frac_bits=8):
-    """Derive optimal HLS type config from data range. Returns {"type_class", "width", "int"}."""
+    """Derive the HLS type config from the data range. Returns {"type_class", "width", "int"}."""
     if is_integer and not is_signed:
         bits = max(math.ceil(math.log2(max(int(max_val), 1) + 1)), 1)
         w = _round_up_4(bits)
