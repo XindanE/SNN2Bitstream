@@ -176,6 +176,8 @@ def standardize_state_dict(model, input_shape):
                     "kernel_size": k,
                     "stride":      s,
                     "padding":     p,
+                    "in_h":        cur_h,
+                    "in_w":        cur_w,
                     "out_h":       out_h,
                     "out_w":       out_w,
                 })
@@ -218,6 +220,8 @@ def standardize_state_dict(model, input_shape):
                     "kernel_size": k,
                     "stride":      s,
                     "padding":     p,
+                    "in_h":        cur_h,
+                    "in_w":        cur_w,
                     "out_h":       out_h,
                     "out_w":       out_w,
                 })
