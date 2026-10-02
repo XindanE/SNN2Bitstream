@@ -85,8 +85,10 @@ void dw_conv_layer{{ index }}(
 {% if quant_weight %}
     // scale_t carries higher precision so small values are not truncated to 0.
     const scale_t weight_scale = ((scale_t)({{ quant_weight.scale }}));
+{% if quant_bias %}
     const scale_t bias_scale = ((scale_t)({{ quant_bias.scale }}));
     const int bias_zero_point = {{ quant_bias.zero_point }};
+{% endif %}
     // Bias dequant precomputed in Python double; see conv_layer for the precision rationale.
     const data_t bias_dequant_table[{{ layer.channels }}] = {
 {% for v in bias_dequant_table %}

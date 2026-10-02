@@ -120,8 +120,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
 
     sanity_check_ir(ir, os.path.dirname(ir_path))
 
-    if backend != "bambu" and not use_fixed and any(
-            L["type"] in ("Conv2d", "DepthwiseConv2d") and L.get("quant_weight") for L in ir["layers"]):
+    if backend != "bambu" and not use_fixed and any(L.get("quant_weight") for L in ir["layers"]):
         raise SystemExit("Error: Quantized weights need --config SQ or SPQ.")
     if not use_pragma and opt_tags & {"conv_ic", "pack_spikes"}:
         print("[Info] --unroll ic and --pack-spikes need --config SP or SPQ with the Vitis backend; ignored")
@@ -569,6 +568,9 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
                 data_t_max = 2 ** (fixed_config.get("int", 16) - 1)
                 if largest > data_t_max * 0.9:
                     print(f"[SANITY] L{i} {ltype}: bias_dequant max={largest:.2e} >= 0.9xdata_t.max - saturation risk")
+        elif layer.get("quant_weight") and not layer.get("bias"):
+            # no bias: the templates still add a dequant table entry
+            bias_dequant_table = [0.0] * len(bias_loaded)
 
         ctx = {
             "index": i, "layer": layer,

@@ -232,11 +232,15 @@ def emit_param_headers(ir_path, ir, out_dir, fixed_config):
         if not os.path.isfile(w_path):
             raise SystemExit(f"[Error] weight CSV not found: {w_path} (IR dir incomplete; re-run export_ir)")
         w = np.loadtxt(w_path, delimiter=",", dtype=dtype_np)
-        b = np.loadtxt(os.path.join(base, b_csv), delimiter=",", dtype=dtype_np) if b_csv else None
+        if b_csv:
+            b = np.loadtxt(os.path.join(base, b_csv), delimiter=",", dtype=dtype_np)
+        else:
+            # no bias: the templates still include and add one
+            out_key = {"Linear": "out_dim", "Conv2d": "out_ch", "DepthwiseConv2d": "channels"}[L["type"]]
+            b = np.zeros(int(L[out_key]), dtype_np)
 
         # Stash the bias array on the layer so convert_model can precompute bias_dequant_table for the LUT path that fixes bias_scale precision loss in the (acc_t) cast.
-        if b is not None:
-            L["_bias_loaded"] = b.flatten().tolist()
+        L["_bias_loaded"] = b.flatten().tolist()
 
         match L["type"]:
             case "Linear":
@@ -247,25 +251,22 @@ def emit_param_headers(ir_path, ir, out_dir, fixed_config):
                 if n_chunks > 1:
                     L["_weight_split_chunks"]    = n_chunks
                     L["_weight_split_chunk_rows"] = (O + n_chunks - 1) // n_chunks
-                if b is not None:
-                    _write_array(os.path.join(out_dir, f"biases{p}.h"),
-                                 f"biases{p}", b.reshape(O), dtype_c_b)
+                _write_array(os.path.join(out_dir, f"biases{p}.h"),
+                             f"biases{p}", b.reshape(O), dtype_c_b)
 
             case "DepthwiseConv2d":
                 C, K = int(L["channels"]), int(L["kernel_size"])
                 _write_array(os.path.join(out_dir, f"weights{p}.h"),
                              f"weights{p}", w.reshape(C, K, K), dtype_c_w)
-                if b is not None:
-                    _write_array(os.path.join(out_dir, f"biases{p}.h"),
-                                 f"biases{p}", b.reshape(C), dtype_c_b)
+                _write_array(os.path.join(out_dir, f"biases{p}.h"),
+                             f"biases{p}", b.reshape(C), dtype_c_b)
 
             case "Conv2d":
                 OC, IC, K = int(L["out_ch"]), int(L["in_ch"]), int(L["kernel_size"])
                 _write_array(os.path.join(out_dir, f"weights{p}.h"),
                              f"weights{p}", w.reshape(OC, IC, K, K), dtype_c_w)
-                if b is not None:
-                    _write_array(os.path.join(out_dir, f"biases{p}.h"),
-                                 f"biases{p}", b.reshape(OC), dtype_c_b)
+                _write_array(os.path.join(out_dir, f"biases{p}.h"),
+                             f"biases{p}", b.reshape(OC), dtype_c_b)
 
         if is_quant:
             print(f"[Done] Quantized headers: {L.get('name', 'unknown')} (bit_width={bit_width})")
