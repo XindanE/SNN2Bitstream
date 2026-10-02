@@ -88,10 +88,13 @@ BSHIFT_FLAG=""         # Bit-shift LIF leak instead of beta multiply
 BINARY_FLAG=""         # Treat input as binary {0,1} (custom route: no train-time detection)
 CONV_OC_FACTOR_FLAG=""
 CONV_OC_MAX_FLAG=""
+PACK_SPIKES_FLAG=""
+CONV_PARALLEL_MAX_FLAG=""
 USER_PROJECT=""
 QUANT_BITS=""
 CODEGEN_TOML=""
 _CLI_CONFIG_SET="0"
+_CLI_CSIM_SET=""
 MUL_FABRIC_FLAG=""
 SD_ENC_FLAG=""
 STREAMING_FLAG=""
@@ -117,6 +120,10 @@ while [ "$#" -gt 0 ]; do
             UNROLL_FLAG="--unroll $2"; shift 2 ;;
         --dataflow)
             DATAFLOW_FLAG="--dataflow"; shift ;;
+        --pack-spikes)
+            PACK_SPIKES_FLAG="--pack-spikes"; shift ;;
+        --conv-parallel-max)
+            CONV_PARALLEL_MAX_FLAG="--conv-parallel-max $2"; shift 2 ;;
         --sparse)
             SPARSE_FLAG="--sparse"
             if [[ "${2:-}" == "sp" ]]; then shift 2; else shift; fi ;;
@@ -196,6 +203,8 @@ print("TOML_DATAFLOW=" + str(g("dataflow", "")).lower())
 print("TOML_PARALLEL_FACTOR=" + str(g("parallel_factor", "")))
 print("TOML_CONV_OC_FACTOR=" + str(g("conv_oc_factor", "")))
 print("TOML_CONV_OC_MAX=" + str(g("conv_oc_max", "")))
+print("TOML_PACK_SPIKES=" + str(g("pack_spikes", "")).lower())
+print("TOML_CONV_PARALLEL_MAX=" + str(g("conv_parallel_max", "")))
 print("TOML_CSIM_APFIXED=" + str(g("csim_apfixed", "")).lower())
 print("TOML_STREAMING=" + str(g("streaming", "")).lower())
 print("TOML_DATA_WIDTH=" + str(g("data_width", "")))
@@ -222,6 +231,8 @@ PYEOF
     if [[ -n "${TOML_QUANT_BITS:-}" && -z "$QUANT_BITS" ]]; then QUANT_BITS="$TOML_QUANT_BITS"; fi
     if [[ -n "${TOML_UNROLL:-}" && -z "$UNROLL_FLAG" ]]; then UNROLL_FLAG="--unroll $TOML_UNROLL"; fi
     if [[ "${TOML_DATAFLOW:-}" == "true" && -z "$DATAFLOW_FLAG" ]]; then DATAFLOW_FLAG="--dataflow"; fi
+    if [[ "${TOML_PACK_SPIKES:-}" == "true" && -z "$PACK_SPIKES_FLAG" ]]; then PACK_SPIKES_FLAG="--pack-spikes"; fi
+    if [[ -n "${TOML_CONV_PARALLEL_MAX:-}" && -z "$CONV_PARALLEL_MAX_FLAG" ]]; then CONV_PARALLEL_MAX_FLAG="--conv-parallel-max $TOML_CONV_PARALLEL_MAX"; fi
     if [[ -n "${TOML_PARALLEL_FACTOR:-}" && -z "$PARALLEL_FACTOR" ]]; then PARALLEL_FACTOR="--parallel-factor $TOML_PARALLEL_FACTOR"; fi
     if [[ -n "${TOML_CONV_OC_FACTOR:-}" && -z "$CONV_OC_FACTOR_FLAG" ]]; then CONV_OC_FACTOR_FLAG="--conv-oc-factor $TOML_CONV_OC_FACTOR"; fi
     if [[ -n "${TOML_CONV_OC_MAX:-}" && -z "$CONV_OC_MAX_FLAG" ]]; then CONV_OC_MAX_FLAG="--conv-oc-max $TOML_CONV_OC_MAX"; fi
@@ -280,6 +291,7 @@ echo "INPUT_SHAPE     = ${INPUT_SHAPE:-auto}"
 echo "DATASET         = ${DATASET_KIND:-not specified (test step will be skipped)}"
 if [[ -n "$PARALLEL_FACTOR" ]]; then echo "PARALLEL_FACTOR = ${PARALLEL_FACTOR#--parallel-factor }"; fi
 if [[ -n "$UNROLL_FLAG" ]]; then echo "UNROLL          = ${UNROLL_FLAG#--unroll }"; fi
+if [[ -n "$PACK_SPIKES_FLAG" ]]; then echo "PACK_SPIKES     = enabled"; fi
 if [[ -n "$DATAFLOW_FLAG" ]]; then echo "DATAFLOW        = enabled"; fi
 if [[ -n "$SPARSE_FLAG" ]]; then echo "SPARSE          = enabled"; fi
 if [[ -n "$QUANT_BITS" ]]; then echo "QUANT_BITS      = ${QUANT_BITS}"; fi
@@ -345,7 +357,7 @@ echo -e "\n[3/5] Running converter (config=${CONFIG}) ..."
 CONVERTER_PROJECT_ARG=""
 if [[ -n "$USER_PROJECT" ]]; then CONVERTER_PROJECT_ARG="--project $USER_PROJECT"; fi
 run_logged python "${ROOT_DIR}/converter/converter.py" "${IR_JSON}" --config "${CONFIG}" \
-    $PARALLEL_FACTOR $UNROLL_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
+    $PARALLEL_FACTOR $UNROLL_FLAG $PACK_SPIKES_FLAG $CONV_PARALLEL_MAX_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
     $BINARY_FLAG $MUL_FABRIC_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
     $BACKEND_ARG $BAMBU_OPT_ARG ${BAMBU_EXTRA_ARG:+"$BAMBU_EXTRA_ARG"}

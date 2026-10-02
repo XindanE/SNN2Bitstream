@@ -99,7 +99,7 @@ def sanity_check_ir(ir, ir_dir, thr_eps=1e-3, sat_warn_threshold=0.5):
 
 # Schema for the optimization / data_identity / per-layer opt sections.
 VALID_LAYER_TYPES  = {"Conv2d", "DepthwiseConv2d", "AvgPool2d", "MaxPool2d", "Linear", "LIF"}
-VALID_OPT_TAGS     = {"conv_kernel", "conv_ic", "dataflow"}
+VALID_OPT_TAGS     = {"conv_kernel", "conv_ic", "pack_spikes", "dataflow"}
 VALID_CONFIGS      = {"S", "SP", "SQ", "SPQ"}
 VALID_ENCODINGS    = {"repeat", "rate", "temporal", "delta"}
 VALID_VALUE_CODING = {"spike", "count"}

@@ -56,7 +56,7 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--config` | `S` \| `SP` \| `SQ` \| `SPQ` | `S` baseline; `+P` HLS pragmas; `+Q` quantization. `SPQ` = full. |
 | `--quant` | `qat_ft` \| `qat` \| `ptq` | Quantization method (`qat_ft`, QAT fine-tuning from a float model, is the default and most accurate). |
 | `--quant-bits` | `2`–`16` (default `8`) | Weight/activation bit width. `4` and `8` are validated; above `8` is accepted with a warning. |
-| `--unroll` | `ck` | Convolution kernel unrolling: kernel loops + weight partitioning. |
+| `--unroll` | `ck` \| `ic` | `ck`: convolution kernel unrolling (kernel loops + weight partitioning). `ic`: also unrolls input channels; faster, uses more memory. |
 | `--sparse` | (flag) or `sp` | Spike-driven sparsity in FC layers. |
 | `--backend` | `vitis` \| `bambu` | HLS backend (default `vitis`; `bambu` is open-source). |
 
@@ -71,6 +71,8 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--mul-impl-fabric` | Multiplies on LUTs instead of DSPs (binary-input FC only). |
 | `--streaming` | Per-stage AXI-Stream design. |
 | `--parallel-factor N` | FC unroll factor (default 8). |
+| `--pack-spikes` | Read all input spikes of a pixel as one word in conv layers (SPQ). |
+| `--conv-parallel-max N` | Largest IC×K×K per conv layer for `--unroll ic` (default 144). |
 | `--pretrained <ckpt>` | Start from an existing FP32 checkpoint (config route). |
 | `--project <name>` | Write the output to a separate project directory. |
 | `--input-shape C,H,W` | Input shape, required for Conv2d models on the custom route. |
@@ -89,7 +91,7 @@ Deploy your own pre-trained snnTorch model. Put the model class in a Python file
 # CSNN
 ./snn2bitstream full --custom user_model.nmnist_small.SurrogateCSNN \
     --weights user_model/nmnist_model_csnn_10.pt --project mycsnn --timestep 10 --dataset nmnist --input-shape 2,34,34 \
-    --unroll ck --sparse --data-width 16
+    --unroll ic --pack-spikes --sparse --data-width 16
 ```
 
 Support for custom models is currently limited.
@@ -128,7 +130,7 @@ Then open the Vitis workspace `backend_projects/<project_name>/xilinx/vitis_<pro
 
 ## Publication
 
-The article introducing *SNN2Bitstream* has been accepted for presentation at the IEEE International Conference on Artificial Intelligence Circuits and Systems (AICAS) 2026.
+The article introducing *SNN2Bitstream* has been accepted for presentation at the IEEE International Conference on Artificial Intelligence Circuits and Systems (AICAS) 2026. The framework is still being optimized, so current results may be better than those reported in the paper.
 
 ### Citation
 

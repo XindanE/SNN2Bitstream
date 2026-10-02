@@ -52,6 +52,15 @@ typedef float w_t;
 typedef double acc_t;
 typedef double scale_t;
 #endif
+{% if input_buffer == "packed" %}
+
+// one bit per input channel
+#if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
+typedef ap_uint<{{ layer.in_ch }}> packed_t;
+#else
+typedef {{ "uint32_t" if layer.in_ch <= 32 else "uint64_t" }} packed_t;
+#endif
+{% endif %}
 {% else %}
 // Float mode
 typedef float data_t;
@@ -80,7 +89,7 @@ void conv_layer{{ index }}(
 #pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=3
 #pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=4
 {% endif %}
-{% if "conv_ic" in opt_tags %}
+{% if input_buffer != "flat" %}
 #pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=2
 {% endif %}
 {% endif %}
@@ -113,7 +122,45 @@ void conv_layer{{ index }}(
 #pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} complete dim=1
 {% endif %}
 
-{% if conv_partition_factor > 0 %}
+{% if input_buffer == "packed" %}
+    // zero border, K x K banks
+    const int PH = IH + 2 * P;
+    const int PW = IW + 2 * P;
+    packed_t local_packed[PH][PW];
+#pragma HLS ARRAY_PARTITION variable=local_packed cyclic factor={{ layer.kernel_size }} dim=1
+#pragma HLS ARRAY_PARTITION variable=local_packed cyclic factor={{ layer.kernel_size }} dim=2
+    CONV{{ index }}_LOAD_IN: for (int i = 0; i < IC * PH * PW; i++) {
+#pragma HLS PIPELINE II=1
+#pragma HLS DEPENDENCE variable=local_packed inter false
+        int ic = i / (PH * PW);
+        int ph = (i / PW) % PH;
+        int pw = i % PW;
+        int ih = ph - P;
+        int iw = pw - P;
+        bool inside = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
+        packed_t bit = (inside && in[(ic * IH + ih) * IW + iw]) ? 1 : 0;
+        packed_t prev = (ic == 0) ? (packed_t)0 : local_packed[ph][pw];
+        local_packed[ph][pw] = prev | (bit << ic);
+    }
+{% elif input_buffer == "banked" %}
+    // per channel, K x K banks
+{% if use_fixed and input_is_spike %}
+    spike_t local_in[IC][IH][IW];
+{% else %}
+    data_t local_in[IC][IH][IW];
+{% endif %}
+#pragma HLS ARRAY_PARTITION variable=local_in complete dim=1
+#pragma HLS ARRAY_PARTITION variable=local_in cyclic factor={{ layer.kernel_size }} dim=2
+#pragma HLS ARRAY_PARTITION variable=local_in cyclic factor={{ layer.kernel_size }} dim=3
+    CONV{{ index }}_LOAD_IN: for (int i = 0; i < IC * IH * IW; i++) {
+#pragma HLS PIPELINE II=1
+{% if use_fixed and input_is_spike %}
+        local_in[i / (IH * IW)][(i / IW) % IH][i % IW] = in[i];
+{% else %}
+        local_in[i / (IH * IW)][(i / IW) % IH][i % IW] = (data_t)in[i];
+{% endif %}
+    }
+{% elif conv_partition_factor > 0 %}
     // Local input copy for read bandwidth. Partition factor={{ conv_partition_factor }} is auto-capped for LUTRAM safety.
 {% if use_fixed and input_is_spike %}
     // Spike input is 1-bit: keep the buffer as spike_t to save BRAM/registers.
@@ -150,10 +197,23 @@ void conv_layer{{ index }}(
 {% endif %}
             }
 
-            for (int ic = 0; ic < IC; ic++) {
-{% if "conv_ic" in opt_tags %}
+{% if input_buffer == "packed" %}
+            for (int kh = 0; kh < K; kh++) {
 #pragma HLS UNROLL
-{% endif %}
+                for (int kw = 0; kw < K; kw++) {
+#pragma HLS UNROLL
+                    packed_t word = local_packed[oh * S + kh][ow * S + kw];
+                    for (int ic = 0; ic < IC; ic++) {
+#pragma HLS UNROLL
+                        for (int oc = 0; oc < {{ layer.oc_factor }}; oc++) {
+#pragma HLS UNROLL
+                            lane_acc[oc] += ((word >> ic) & 1) ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
+                        }
+                    }
+                }
+            }
+{% else %}
+            for (int ic = 0; ic < IC; ic++) {
                 for (int kh = 0; kh < K; kh++) {
 #pragma HLS UNROLL
                     for (int kw = 0; kw < K; kw++) {
@@ -161,10 +221,18 @@ void conv_layer{{ index }}(
                         int ih = oh * S - P + kh;
                         int iw = ow * S - P + kw;
                         if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+{% if input_buffer != "banked" %}
                             int in_idx = ic * IH * IW + ih * IW + iw;
+{% endif %}
                             for (int oc = 0; oc < {{ layer.oc_factor }}; oc++) {
 #pragma HLS UNROLL
-{% if conv_partition_factor > 0 %}
+{% if input_buffer == "banked" %}
+{% if input_is_spike %}
+                                lane_acc[oc] += local_in[ic][ih][iw] ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
+{% else %}
+                                lane_acc[oc] += (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] * (acc_t)local_in[ic][ih][iw];
+{% endif %}
+{% elif conv_partition_factor > 0 %}
 {% if input_is_spike %}
                                 lane_acc[oc] += local_in[in_idx] ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
 {% else %}
@@ -182,6 +250,7 @@ void conv_layer{{ index }}(
                     }
                 }
             }
+{% endif %}
 
             WRITE_LANES{{ index }}: for (int oc = 0; oc < {{ layer.oc_factor }}; oc++) {
 #pragma HLS UNROLL
@@ -195,7 +264,7 @@ void conv_layer{{ index }}(
         }
     }
 {% else %}
-{# Legacy path (oc_factor=0): unchanged from baseline #}
+{# Legacy path (oc_factor=0) #}
     for (int oc = 0; oc < OC; oc++) {
         for (int oh = 0; oh < OH; oh++) {
             for (int ow = 0; ow < OW; ow++) {
@@ -209,10 +278,20 @@ void conv_layer{{ index }}(
 {% else %}
                 acc_t acc = ((acc_t)(biases{{ layer.pair_idx }}[oc]));
 {% endif %}
-                for (int ic = 0; ic < IC; ic++) {
-{% if use_pragma and "conv_ic" in opt_tags %}
+{% if input_buffer == "packed" %}
+                for (int kh = 0; kh < K; kh++) {
 #pragma HLS UNROLL
-{% endif %}
+                    for (int kw = 0; kw < K; kw++) {
+#pragma HLS UNROLL
+                        packed_t word = local_packed[oh * S + kh][ow * S + kw];
+                        for (int ic = 0; ic < IC; ic++) {
+#pragma HLS UNROLL
+                            acc += ((word >> ic) & 1) ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
+                        }
+                    }
+                }
+{% else %}
+                for (int ic = 0; ic < IC; ic++) {
                     for (int kh = 0; kh < K; kh++) {
 {% if use_pragma and "conv_kernel" in opt_tags %}
 #pragma HLS UNROLL
@@ -224,8 +303,16 @@ void conv_layer{{ index }}(
                             int ih = oh * S - P + kh;
                             int iw = ow * S - P + kw;
                             if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
+{% if input_buffer != "banked" %}
                                 int in_idx = ic * IH * IW + ih * IW + iw;
-{% if conv_partition_factor > 0 %}
+{% endif %}
+{% if input_buffer == "banked" %}
+{% if input_is_spike %}
+                                acc += local_in[ic][ih][iw] ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
+{% else %}
+                                acc += (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] * (acc_t)local_in[ic][ih][iw];
+{% endif %}
+{% elif conv_partition_factor > 0 %}
 {% if input_is_spike %}
                                 acc += local_in[in_idx] ? (acc_t)weights{{ layer.pair_idx }}[oc][ic][kh][kw] : (acc_t)0;
 {% else %}
@@ -242,6 +329,7 @@ void conv_layer{{ index }}(
                         }
                     }
                 }
+{% endif %}
 {% if quant_weight %}
                 data_t bias_dequant = bias_dequant_table[oc];
                 out[oc * OH * OW + oh * OW + ow] = (data_t)(acc * weight_scale) + bias_dequant;

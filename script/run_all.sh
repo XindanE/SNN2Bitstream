@@ -67,11 +67,11 @@ if [[ "$STAGE" == "hw" ]]; then
     exec "${ROOT_DIR}/script/run_xilinx.sh" "$1"
 fi
 
-# Detect model source
+# Detect model source; with --custom, --toml only supplies [codegen]
 SOURCE=""
 for a in "$@"; do
     case "$a" in
-        --toml)   SOURCE="toml" ;;
+        --toml)   [[ -z "$SOURCE" ]] && SOURCE="toml" ;;
         --custom) SOURCE="custom" ;;
     esac
 done

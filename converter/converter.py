@@ -53,7 +53,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
                   parallel_factor=8, opt_tags=None,
                   project_name=None, use_sparse=False,
                   streaming=False,
-                  conv_oc_factor="0", conv_oc_max=16,
+                  conv_oc_factor="0", conv_oc_max=16, conv_parallel_max=144,
                   per_layer_scale=True, per_layer_acc=True, per_layer_lif_mem=True,
                   lif_mem_profile=None, lif_mem_slack=2.0,
                   backend="vitis", bambu_opt=None, bambu_extra=None,
@@ -66,8 +66,8 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
         use_pragma = False
 
     # Resolve opt_tags
-    VALID_OPT_TAGS   = {"conv_kernel", "conv_ic", "dataflow"}
-    OPT_TAG_REQUIRES = {"conv_ic": ["conv_kernel"]}
+    VALID_OPT_TAGS   = {"conv_kernel", "conv_ic", "pack_spikes", "dataflow"}
+    OPT_TAG_REQUIRES = {"conv_ic": ["conv_kernel"], "pack_spikes": ["conv_kernel"]}
 
     # Normalize conv_oc_factor: "auto" stays; numeric string -> int; None -> 0
     if conv_oc_factor is None:
@@ -119,6 +119,14 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
             layer["_opt_locked"] = set(locked.keys())
 
     sanity_check_ir(ir, os.path.dirname(ir_path))
+
+    if backend != "bambu" and not use_fixed and any(
+            L["type"] in ("Conv2d", "DepthwiseConv2d") and L.get("quant_weight") for L in ir["layers"]):
+        raise SystemExit("Error: Quantized weights need --config SQ or SPQ.")
+    if not use_pragma and opt_tags & {"conv_ic", "pack_spikes"}:
+        print("[Info] --unroll ic and --pack-spikes need --config SP or SPQ with the Vitis backend; ignored")
+    elif not use_fixed and "pack_spikes" in opt_tags:
+        print("[Info] --pack-spikes needs --config SPQ; ignored")
 
     # Fixed-point / type resolution
     if use_fixed:
@@ -440,8 +448,23 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
     for i, layer in enumerate(ir["layers"]):
         ltype = layer["type"]
 
+        input_buffer = "flat"
+        if use_pragma and ltype == "Conv2d":
+            ic, k = layer.get("in_ch", 1), layer.get("kernel_size", 1)
+            parallel_macs = max(layer.get("oc_factor", 0), 1) * ic * k * k
+            can_pack = "pack_spikes" in opt_tags and use_fixed and i in spike_input_layers
+            if can_pack and 2 <= ic <= 64:
+                input_buffer = "packed"
+            elif "conv_ic" in opt_tags and parallel_macs <= conv_parallel_max:
+                input_buffer = "banked"
+            elif "conv_ic" in opt_tags:
+                print(f"[Info] Layer {i} (Conv2d IC={ic} K={k}): {parallel_macs} parallel MACs "
+                      f"> --conv-parallel-max {conv_parallel_max}, --unroll ic not applied")
+            if can_pack and ic > 64:
+                print(f"[Info] Layer {i} (Conv2d IC={ic}): more than 64 channels, --pack-spikes not applied")
+
         conv_partition_factor = 0
-        if use_pragma and "conv_kernel" in opt_tags and ltype in ("Conv2d", "DepthwiseConv2d"):
+        if input_buffer == "flat" and use_pragma and "conv_kernel" in opt_tags and ltype in ("Conv2d", "DepthwiseConv2d"):
             if ltype == "Conv2d":
                 ic, local_in_ch = layer.get("in_ch", 1), layer.get("in_ch", 1)
             else:
@@ -449,7 +472,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
             ih, iw, k  = layer.get("in_h", 1), layer.get("in_w", 1), layer.get("kernel_size", 1)
             local_in_sz = local_in_ch * ih * iw
             max_safe    = max(1, local_in_sz // MIN_BANK_DEPTH)
-            desired     = (ic * k * k) if ("conv_ic" in opt_tags and ltype == "Conv2d") else (k * k)
+            desired     = k * k
             conv_partition_factor = min(desired, max_safe)
             if conv_partition_factor < 2:
                 conv_partition_factor = 0
@@ -556,6 +579,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
             "use_fixed": use_fixed, "use_pragma": use_pragma,
             "parallel_factor": parallel_factor, "opt_tags": opt_tags,
             "conv_partition_factor": conv_partition_factor,
+            "input_buffer": input_buffer,
             "input_is_spike": i in spike_input_layers,
             "use_sparse": use_sparse and ltype == "Linear",   # FC-only; Conv if-skip gave ~0% and is dropped
             "act_quant": layer.get("act_quant"),
@@ -787,6 +811,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
         "data_int":        fixed_config.get("int") if use_fixed else None,
         "conv_oc_factor":  conv_oc_factor,
         "conv_oc_max":     conv_oc_max,
+        "conv_parallel_max": conv_parallel_max,
         "lif_mem_profile": lif_mem_profile is not None,
         "lif_mem_slack":   lif_mem_slack,
         "backend":         backend,
@@ -833,8 +858,13 @@ if __name__ == "__main__":
     parser.add_argument("--parallel-factor", type=int, default=None,
                         help="Unroll factor for large FC/Conv loops (default: 8)")
     parser.add_argument("--unroll",          type=str, default=None,
-                        help="Convolution unroll tags: ck (kernel loops), ic (input-channel), "
-                             "oc (output-channel). ic and oc imply ck.")
+                        help="Convolution unroll tags: ck (kernel loops), ic (input channels, "
+                             "see --conv-parallel-max), oc (output-channel). ic and oc imply ck.")
+    parser.add_argument("--pack-spikes",     action="store_true",
+                        help="Pack 1-bit spike inputs of a conv layer into one word per pixel "
+                             "(up to 64 channels, SPQ only). Implies --unroll ck.")
+    parser.add_argument("--conv-parallel-max", type=int, default=None,
+                        help="Max parallel MACs per conv layer for --unroll ic (default: 144)")
     parser.add_argument("--dataflow",        action="store_true",
                         help="Enable the DATAFLOW pragma on the timestep loop with inter-stage PIPO.")
     parser.add_argument("--sparse",          nargs="?", const="sp", default=None,
@@ -912,7 +942,7 @@ if __name__ == "__main__":
                 setattr(args, _flag, True)
 
     # Explicit CLI values take precedence over IR values and built-in defaults.
-    for name, default in (("conv_oc_factor", "0"), ("conv_oc_max", 16),
+    for name, default in (("conv_oc_factor", "0"), ("conv_oc_max", 16), ("conv_parallel_max", 144),
                           ("parallel_factor", 8), ("backend", "vitis")):
         if getattr(args, name) is None:
             value = _ir_opt.get(name)
@@ -934,6 +964,8 @@ if __name__ == "__main__":
         opt_tags.append("conv_kernel")
     if "ic" in unroll:
         opt_tags.append("conv_ic")     # convert_model auto-adds conv_kernel as its dependency
+    if args.pack_spikes:
+        opt_tags.append("pack_spikes")
     if args.dataflow:
         opt_tags.append("dataflow")
     opt_tags = opt_tags or None
@@ -954,6 +986,7 @@ if __name__ == "__main__":
                   project_name=args.project, use_sparse=args.sparse is not None,
                   streaming=args.streaming,
                   conv_oc_factor=conv_oc_factor, conv_oc_max=args.conv_oc_max,
+                  conv_parallel_max=args.conv_parallel_max,
                   per_layer_scale=not args.no_per_layer_scale,
                   per_layer_acc=not args.no_per_layer_acc,
                   per_layer_lif_mem=not args.no_per_layer_lif_mem,

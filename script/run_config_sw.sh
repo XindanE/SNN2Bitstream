@@ -60,6 +60,8 @@ DATA_WIDTH_FLAG=""     # --data-width: data_t width override (avoids the default
 DATA_INT_FLAG=""       # --data-int-width: data_t integer width (pairs with --data-width)
 MAX_SAMPLES=""         # --max-samples: cap the GCC test sample count (fast subset accuracy)
 CONV_OC_MAX_FLAG=""    # --conv-oc-max: auto threshold for OC unroll
+PACK_SPIKES_FLAG=""    # --pack-spikes: channel-packed spike input for conv layers
+CONV_PARALLEL_MAX_FLAG="" # --conv-parallel-max: limit for --unroll ic
 CLI_DATA_WIDTH=""      # CLI overrides for the TOML [codegen] equivalents below
 CLI_DATA_INT=""
 CLI_BACKEND=""
@@ -102,6 +104,14 @@ while [ "$#" -gt 0 ]; do
         --dataflow)
             DATAFLOW_FLAG="--dataflow"
             shift
+            ;;
+        --pack-spikes)
+            PACK_SPIKES_FLAG="--pack-spikes"
+            shift
+            ;;
+        --conv-parallel-max)
+            CONV_PARALLEL_MAX_FLAG="--conv-parallel-max $2"
+            shift 2
             ;;
         --sparse)
             SPARSE_FLAG="--sparse"
@@ -292,6 +302,8 @@ print("TOML_PARALLEL_FACTOR=" + str(g("parallel_factor", "")))
 print("TOML_STREAMING=" + str(g("streaming", "")).lower())
 print("TOML_CONV_OC_FACTOR=" + str(g("conv_oc_factor", "")))
 print("TOML_CONV_OC_MAX=" + str(g("conv_oc_max", "")))
+print("TOML_PACK_SPIKES=" + str(g("pack_spikes", "")).lower())
+print("TOML_CONV_PARALLEL_MAX=" + str(g("conv_parallel_max", "")))
 print("TOML_DATA_WIDTH=" + str(g("data_width", "")))
 print("TOML_SD_ENCODING=" + str(g("sd_encoding", "")))
 print("TOML_CSIM_APFIXED=" + str(g("csim_apfixed", "")).lower())
@@ -310,7 +322,7 @@ PYEOF
     echo "[Warn] failed to read [codegen] from TOML (section may not exist)"
     TOML_CONFIG="" TOML_SPARSE="" TOML_FOLD="" TOML_BSHIFT="" TOML_QUANT="" TOML_QUANT_BITS=""
     TOML_UNROLL="" TOML_DATAFLOW="" TOML_CHECKPOINT="" TOML_PARALLEL_FACTOR="" TOML_STREAMING=""
-    TOML_CONV_OC_FACTOR="" TOML_CONV_OC_MAX="" TOML_DATA_WIDTH=""
+    TOML_CONV_OC_FACTOR="" TOML_CONV_OC_MAX="" TOML_DATA_WIDTH="" TOML_PACK_SPIKES="" TOML_CONV_PARALLEL_MAX=""
     TOML_BACKEND="" TOML_BAMBU_OPT="" TOML_BAMBU_EXTRA=""
     TOML_CSIM_APFIXED=""
 }
@@ -342,6 +354,12 @@ if [[ -n "$TOML_UNROLL" && -z "$UNROLL_FLAG" ]]; then
 fi
 if [[ "$TOML_DATAFLOW" == "true" && -z "$DATAFLOW_FLAG" ]]; then
     DATAFLOW_FLAG="--dataflow"
+fi
+if [[ "$TOML_PACK_SPIKES" == "true" && -z "$PACK_SPIKES_FLAG" ]]; then
+    PACK_SPIKES_FLAG="--pack-spikes"
+fi
+if [[ -n "$TOML_CONV_PARALLEL_MAX" && -z "$CONV_PARALLEL_MAX_FLAG" ]]; then
+    CONV_PARALLEL_MAX_FLAG="--conv-parallel-max $TOML_CONV_PARALLEL_MAX"
 fi
 if [[ -n "$TOML_CHECKPOINT" && -z "$USER_PRETRAINED" ]]; then
     TOML_CKPT_OVERRIDE="$TOML_CHECKPOINT"
@@ -468,6 +486,7 @@ echo "User Pretrained: $USER_PRETRAINED"
 fi
 if [[ -n "$PARALLEL_FACTOR" ]]; then echo "Parallel Factor: ${PARALLEL_FACTOR#--parallel-factor }"; fi
 if [[ -n "$UNROLL_FLAG" ]]; then echo "Unroll: ${UNROLL_FLAG#--unroll }"; fi
+if [[ -n "$PACK_SPIKES_FLAG" ]]; then echo "Pack spikes: enabled"; fi
 if [[ -n "$DATAFLOW_FLAG" ]]; then echo "Dataflow: enabled"; fi
 if [[ -n "$CONV_OC_FACTOR_FLAG" ]]; then echo "Conv OC: ${CONV_OC_FACTOR_FLAG#--conv-oc-factor }"; fi
 if [[ -n "$CONV_OC_MAX_FLAG" ]]; then echo "Conv OC max: ${CONV_OC_MAX_FLAG#--conv-oc-max }"; fi
@@ -607,7 +626,7 @@ case "$BACKEND" in
 esac
 
 run_logged python3 converter/converter.py "$IR_DIR/ir.json" --config "$CONFIG" \
-    $PARALLEL_FACTOR $UNROLL_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
+    $PARALLEL_FACTOR $UNROLL_FLAG $PACK_SPIKES_FLAG $CONV_PARALLEL_MAX_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
     $MUL_FABRIC_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
     $BACKEND_ARG $BAMBU_OPT_ARG ${BAMBU_EXTRA_ARG:+"$BAMBU_EXTRA_ARG"}
@@ -743,6 +762,7 @@ SW_REPORT="${OUT_C_DIR}/sw_report.txt"
     echo "Quant Method: ${QUANT_METHOD}"
     if [[ -n "$QUANT_BITS" ]]; then echo "Quant Bits: ${QUANT_BITS}"; fi
     if [[ -n "$UNROLL_FLAG" ]]; then echo "Unroll: ${UNROLL_FLAG#--unroll }"; fi
+    if [[ -n "$PACK_SPIKES_FLAG" ]]; then echo "Pack spikes: enabled"; fi
 if [[ -n "$DATAFLOW_FLAG" ]]; then echo "Dataflow: enabled"; fi
     if [[ -n "$CONV_OC_FACTOR_FLAG" ]]; then echo "Conv OC: ${CONV_OC_FACTOR_FLAG#--conv-oc-factor }"; fi
     if [[ -n "$CONV_OC_MAX_FLAG" ]]; then echo "Conv OC max: ${CONV_OC_MAX_FLAG#--conv-oc-max }"; fi
