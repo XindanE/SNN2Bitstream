@@ -18,7 +18,7 @@
 """Stage a project's board test data for the SD card, splitting fall.bin to fit FAT32.
 
 Reads SD_DATA_DIR / SD_SAMPLES_PER_FILE / SD_NUM_SAMPLES from the project's generated
-model.h, takes the local single test_data/<dataset>/fall.bin (+ labels.bin), and writes
+model.h, takes test_data/<dataset>/<encoding>/t<T>/fall.bin (+ labels.bin), and writes
 an SD-ready tree under <out>/<SD_DATA_DIR>/:
 
   * SD_SAMPLES_PER_FILE == 0 -> a single fall.bin (dataset already fits under 4 GiB).
@@ -96,13 +96,12 @@ def main():
     _SD_TO_FULL = {"cifardvs": "cifar10dvs", "dvsgest": "dvsgesture"}
     dataset = _SD_TO_FULL.get(sd_dataset, sd_dataset)
 
-    # The SW flow caches under <dataset>_T<timesteps>_<encoding>, which SD_DATA_DIR
-    # already spells out as <dataset>/<encoding>/t<timesteps>. Fall back to a flat
-    # <dataset>/ for data exported by hand, as MNIST needs (the SW flow reads the
-    # raw IDX files for MNIST and never writes fall.bin for it).
+    # Same <dataset>/<encoding>/t<timesteps> layout as SD_DATA_DIR; older caches used
+    # <dataset>_T<timesteps>_<encoding> or a flat <dataset>/.
     parts = sd_data_dir.split("/")
     candidates = []
     if len(parts) >= 3:
+        candidates.append(os.path.join(dataset, parts[1], parts[2]))
         candidates.append(f"{dataset}_T{parts[2].lstrip('t')}_{parts[1]}")
     candidates.append(dataset)
 

@@ -20,7 +20,7 @@ shopt -s nullglob
 
 # Config-route SW flow: TOML, train, IR, C++, GCC test (full dataset).
 # The TOML determines the model architecture (FCN/CSNN); no need to choose a script.
-# Test data is cached in test_data/<dataset>/ and reused across projects.
+# Test data is cached in test_data/<dataset>/<encoding>/t<timesteps>/ and reused across projects.
 #
 # Config: S (float, no pragma), SQ (+ fixed-point quant), SP (+ pragma opt),
 # SPQ (pragma + quant, full optimization).
@@ -612,11 +612,11 @@ run_logged python3 converter/converter.py "$IR_DIR/ir.json" --config "$CONFIG" \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
     $BACKEND_ARG $BAMBU_OPT_ARG ${BAMBU_EXTRA_ARG:+"$BAMBU_EXTRA_ARG"}
 
-# Step 4: Prepare test data (cached in test_data/<dataset>_T<timesteps>_<encoding>/)
+# Step 4: Prepare test data (cached in test_data/<dataset>/<encoding>/t<timesteps>/)
 echo -e "\n[4/5] Preparing test data..."
 
 # Cache test data separately for each dataset, timestep count, and encoding.
-TEST_DATA_DIR="${ROOT_DIR}/test_data/${DATASET_KIND}_T${TIMESTEPS}_${INPUT_ENC_LABEL}"
+TEST_DATA_DIR="${ROOT_DIR}/test_data/${DATASET_KIND}/${INPUT_ENC_LABEL}/t${TIMESTEPS}"
 
 if [[ "$DATASET_KIND" == "mnist" ]]; then
     echo "  MNIST: main_mnist.c reads raw IDX files directly."
@@ -713,7 +713,7 @@ else
     else
         echo "[Info] No test data for '${DATASET_KIND}'; skipping the GCC accuracy test."
         echo "       Code generation finished. To run the test, put your data at"
-        echo "       test_data/${DATASET_KIND}/{fall.bin,labels.bin} in the expected format"
+        echo "       ${TEST_DATA_DIR#"${ROOT_DIR}/"}/{fall.bin,labels.bin} in the expected format"
         echo "       (fall.bin: N x ENCODED_SIZE float32, row-major; labels.bin: N int32)."
         TEST_RESULT="(skipped: no test data for ${DATASET_KIND})"
     fi

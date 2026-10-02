@@ -120,7 +120,7 @@ Generated output (all gitignored):
 `full` and `hw` also build the application ELF. To measure accuracy on the FPGA, copy the test set to an SD card:
 
 ```bash
-python tools/export_mnist_bin.py test_data/mnist --encoding rate --timesteps 10   # MNIST only
+python tools/export_mnist_bin.py test_data/mnist/spike/t10 --encoding rate --timesteps 10   # MNIST only
 python tools/prep_sd_data.py <project_name> --sd <SD_ROOT>
 ```
 

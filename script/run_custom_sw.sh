@@ -20,7 +20,7 @@ shopt -s nullglob
 
 # Custom-route SW flow: standardize_model, export_ir, C++, GCC test (full dataset).
 # Custom route always uses PTQ for quantization (no QAT support).
-# Test data is cached in test_data/<dataset>/ and reused across projects.
+# Test data is cached in test_data/<dataset>/count/t<timesteps>/ and reused across projects.
 
 usage() {
     cat <<EOF
@@ -350,22 +350,23 @@ run_logged python "${ROOT_DIR}/converter/converter.py" "${IR_JSON}" --config "${
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
     $BACKEND_ARG $BAMBU_OPT_ARG ${BAMBU_EXTRA_ARG:+"$BAMBU_EXTRA_ARG"}
 
-# Step 4: Prepare test data (cached in test_data/<dataset>/)
+# Step 4: Prepare test data (cached in test_data/<dataset>/count/t<timesteps>/)
 echo -e "\n[4/5] Preparing test data..."
 
 if [[ -z "$DATASET_KIND" ]]; then
     echo "  --dataset not specified. Skipping test data generation."
     echo "  To run GCC testing, re-run with --dataset <nmnist|cifar10dvs|dvsgesture|mnist>"
 else
-    TEST_DATA_DIR="${ROOT_DIR}/test_data/${DATASET_KIND}"
+    TEST_DATA_DIR="${ROOT_DIR}/test_data/${DATASET_KIND}/count/t${TIMESTEPS}"
 
     GEN_META="${TEST_DATA_DIR}/.gen_meta"
-    CACHED_T=""
-    [[ -f "$GEN_META" ]] && CACHED_T=$(cat "$GEN_META" 2>/dev/null)
+    CACHE_KEY="${TIMESTEPS}_count"
+    CACHED_KEY=""
+    [[ -f "$GEN_META" ]] && CACHED_KEY=$(cat "$GEN_META" 2>/dev/null)
     if [[ "$DATASET_KIND" == "mnist" ]]; then
         echo "  MNIST: main_mnist.c reads raw IDX files directly."
         python3 tools/download_data.py mnist >> "$FLOW_LOG" 2>&1 || true
-    elif [[ -f "${TEST_DATA_DIR}/fall.bin" && "$CACHED_T" == "$TIMESTEPS" ]]; then
+    elif [[ -f "${TEST_DATA_DIR}/fall.bin" && "$CACHED_KEY" == "$CACHE_KEY" ]]; then
         echo "  Test data already exists for T=${TIMESTEPS}: ${TEST_DATA_DIR}"
     else
         echo "  Generating test data for ${DATASET_KIND} (T=${TIMESTEPS}) -> ${TEST_DATA_DIR}..."
@@ -380,7 +381,7 @@ else
             *)
                 echo "[Warn] no export script for dataset '${DATASET_KIND}', skipping." ;;
         esac
-        [[ -f "${TEST_DATA_DIR}/fall.bin" ]] && echo "$TIMESTEPS" > "$GEN_META"
+        [[ -f "${TEST_DATA_DIR}/fall.bin" ]] && echo "$CACHE_KEY" > "$GEN_META"
     fi
 fi
 
@@ -414,8 +415,8 @@ if [[ -z "$DATASET_KIND" || "$DATASET_KIND" != "mnist" ]]; then
     cp "${ROOT_DIR}/tools/main_test.c" .
     SRC_FILES="main_test.c $SRC_FILES"
     run_logged g++ -std=c++11 -O2 -Wall -Wextra $GCC_WARN_FLAGS $CSIM_FLAGS -o test_full $SRC_FILES -lm
-    if [[ -n "$DATASET_KIND" && -f "${ROOT_DIR}/test_data/${DATASET_KIND}/fall.bin" ]]; then
-        ./test_full "${ROOT_DIR}/test_data/${DATASET_KIND}"
+    if [[ -n "$DATASET_KIND" && -f "${TEST_DATA_DIR}/fall.bin" ]]; then
+        ./test_full "${TEST_DATA_DIR}"
         TEST_RESULT=$(grep "\[RESULT\]" sw_test.log | tail -1)
     else
         echo "  Compiled test_full but no test data available. Run manually:"
