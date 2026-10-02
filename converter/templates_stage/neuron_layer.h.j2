@@ -46,13 +46,11 @@ void neuron_layer{{ index }}(
     const data_t in[{{ layer.prev_out_dim }}],
     lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
     spike_t spk[{{ layer.out_dim }}],
-    data_t reset[{{ layer.out_dim }}],
 {% else %}
     data_t out[{{ layer.out_dim }}],
     const data_t in[{{ layer.prev_out_dim }}],
     lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
     data_t spk[{{ layer.out_dim }}],
-    data_t reset[{{ layer.out_dim }}],
 {% endif %}
     data_t beta,
     data_t v_th

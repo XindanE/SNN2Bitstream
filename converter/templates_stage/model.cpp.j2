@@ -113,14 +113,12 @@ void timestep_stage{{ stage.stage_idx + 1 }}(
     data_t *out,
 {% endif %}
     lif_mem_t_{{ stage.lif_layer_idx }} *mem{{ stage.lif_layer_idx }},
-    spike_t *spk{{ stage.lif_layer_idx }},
-    data_t *reset{{ stage.lif_layer_idx }}
+    spike_t *spk{{ stage.lif_layer_idx }}
 {% else %}
     const data_t *in,
     data_t *out,
     lif_mem_t_{{ stage.lif_layer_idx }} *mem{{ stage.lif_layer_idx }},
-    data_t *spk{{ stage.lif_layer_idx }},
-    data_t *reset{{ stage.lif_layer_idx }}
+    data_t *spk{{ stage.lif_layer_idx }}
 {% endif %}
 ) {
 #pragma HLS INLINE off
@@ -197,18 +195,11 @@ void timestep_stage{{ stage.stage_idx + 1 }}(
 {% else %}
     data_t buf_lif{{ layer.global_idx }}[{{ layer.out_dim }}] = {0};
 {% endif %}
-    neuron_layer{{ layer.global_idx }}(buf_lif{{ layer.global_idx }}, {{ ns.prev_buf }}, mem{{ layer.global_idx }}, spk{{ layer.global_idx }}, reset{{ layer.global_idx }}, LIF_BETA_DEFAULTS[{{ stage.lif_order_idx }}], LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}]);
-{% if layer.reset_mechanism|default('subtract') != 'zero' %}
-    reset_node(reset{{ layer.global_idx }}, spk{{ layer.global_idx }}, LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}], {{ layer.out_dim }});
-{% endif %}
+    neuron_layer{{ layer.global_idx }}(buf_lif{{ layer.global_idx }}, {{ ns.prev_buf }}, mem{{ layer.global_idx }}, spk{{ layer.global_idx }}, LIF_BETA_DEFAULTS[{{ stage.lif_order_idx }}], LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}]);
 {% set ns.prev_buf = "buf_lif" ~ layer.global_idx %}
 {% else %}
     {# LIF IS the last layer - write to out (default behavior) #}
-    neuron_layer{{ layer.global_idx }}(out, {{ ns.prev_buf }}, mem{{ layer.global_idx }}, spk{{ layer.global_idx }}, reset{{ layer.global_idx }}, LIF_BETA_DEFAULTS[{{ stage.lif_order_idx }}], LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}]);
-{% endif %}
-
-{% if (layer.is_last_in_stage is not defined or layer.is_last_in_stage) and layer.reset_mechanism|default('subtract') != 'zero' %}
-    reset_node(reset{{ layer.global_idx }}, spk{{ layer.global_idx }}, LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}], {{ layer.out_dim }});
+    neuron_layer{{ layer.global_idx }}(out, {{ ns.prev_buf }}, mem{{ layer.global_idx }}, spk{{ layer.global_idx }}, LIF_BETA_DEFAULTS[{{ stage.lif_order_idx }}], LIF_VTH_DEFAULTS[{{ stage.lif_order_idx }}]);
 {% endif %}
 {% endif %}
 {% endfor %}
@@ -304,7 +295,6 @@ void inference(const float *input, float *output) {
 {% else %}
     static data_t spk{{ lif.global_idx }}[{{ lif.out_dim }}];
 {% endif %}
-    static data_t reset{{ lif.global_idx }}[{{ lif.out_dim }}];
 {% endfor %}
 
     // output accumulator
@@ -330,7 +320,6 @@ void inference(const float *input, float *output) {
 {% else %}
         spk{{ lif.global_idx }}[i] = (data_t)0;
 {% endif %}
-        reset{{ lif.global_idx }}[i] = (data_t)0;
     }
 {% endfor %}
     INIT_ACC: for (int i = 0; i < {{ output_dim }}; ++i) {
@@ -379,10 +368,10 @@ void inference(const float *input, float *output) {
 {% for stage in stages %}
 {% if stage.stage_idx == 0 %}
         // Stage {{ stage.stage_idx + 1 }}
-        timestep_stage{{ stage.stage_idx + 1 }}(in_staging, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }}, reset{{ stage.lif_layer_idx }});
+        timestep_stage{{ stage.stage_idx + 1 }}(in_staging, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }});
 {% else %}
         // Stage {{ stage.stage_idx + 1 }}
-        timestep_stage{{ stage.stage_idx + 1 }}(stage{{ stage.stage_idx }}_out, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }}, reset{{ stage.lif_layer_idx }});
+        timestep_stage{{ stage.stage_idx + 1 }}(stage{{ stage.stage_idx }}_out, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }});
 {% endif %}
 
 {% endfor %}
@@ -467,10 +456,10 @@ void inference(const float *input, float *output) {
 {% for stage in stages %}
 {% if stage.stage_idx == 0 %}
         // Stage {{ stage.stage_idx + 1 }}
-        timestep_stage{{ stage.stage_idx + 1 }}({{ staging }}, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }}, reset{{ stage.lif_layer_idx }});
+        timestep_stage{{ stage.stage_idx + 1 }}({{ staging }}, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }});
 {% else %}
         // Stage {{ stage.stage_idx + 1 }}
-        timestep_stage{{ stage.stage_idx + 1 }}(stage{{ stage.stage_idx }}_out, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }}, reset{{ stage.lif_layer_idx }});
+        timestep_stage{{ stage.stage_idx + 1 }}(stage{{ stage.stage_idx }}_out, stage{{ stage.stage_idx + 1 }}_out, mem{{ stage.lif_layer_idx }}, spk{{ stage.lif_layer_idx }});
 {% endif %}
 
 {% endfor %}

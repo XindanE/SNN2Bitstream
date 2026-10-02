@@ -49,26 +49,20 @@ void neuron_layer{{ index }}(
     const data_t in[{{ layer.prev_out_dim }}],
     lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
     spike_t spk[{{ layer.out_dim }}],
-    data_t reset[{{ layer.out_dim }}],
 {% else %}
     data_t out[{{ layer.out_dim }}],
     const data_t in[{{ layer.prev_out_dim }}],
     lif_mem_t_{{ index }} mem[{{ layer.out_dim }}],
     data_t spk[{{ layer.out_dim }}],
-    data_t reset[{{ layer.out_dim }}],
 {% endif %}
     data_t beta,
     data_t v_th
 ){
-    (void)reset;  // Only subtract mode uses reset[]; suppress unused-param in zero mode
     for (size_t i = 0; i < {{ layer.out_dim }}; ++i) {
 {% if use_pragma %}
 #pragma HLS PIPELINE II=1
 {% if use_fixed %}
 #pragma HLS DEPENDENCE variable=mem inter false
-{% if layer.reset_mechanism|default('subtract') != 'zero' %}
-#pragma HLS DEPENDENCE variable=reset inter false
-{% endif %}
 #pragma HLS DEPENDENCE variable=spk inter false
 {% endif %}
 {% endif %}
@@ -98,32 +92,30 @@ void neuron_layer{{ index }}(
         mem[i]   = (s != (data_t)0) ? (lif_mem_t_{{ index }})0 : (lif_mem_t_{{ index }})m;
 {% endif %}
 {% else %}
-        // Delayed-subtract reset (snntorch reset_mechanism="subtract").
+        // Delayed-subtract reset (snntorch reset_mechanism="subtract"): spk[i] still holds last step's spike; a select avoids a multiply.
+        data_t reset = {{ 'spk[i]' if use_fixed else '(spk[i] != (data_t)0)' }} ? v_th : (data_t)0;
 {% if bit_shift_beta and beta_shift_k %}
         // Bit-shift leak: the shift is only valid on ap_fixed (synth/csim); the GCC float path keeps the multiply.
 #if defined(__SYNTHESIS__) || defined(CSIM_APFIXED)
-        data_t m = ((data_t)mem[i] - ((data_t)mem[i] >> {{ beta_shift_k }})) + in[i] - reset[i];
+        data_t m = ((data_t)mem[i] - ((data_t)mem[i] >> {{ beta_shift_k }})) + in[i] - reset;
 #else
-        data_t m = beta * (data_t)mem[i] + in[i] - reset[i];
+        data_t m = beta * (data_t)mem[i] + in[i] - reset;
 #endif
 {% elif bit_shift_beta %}
-        data_t m = (data_t)mem[i] + in[i] - reset[i];  // beta ~= 1: no leak
+        data_t m = (data_t)mem[i] + in[i] - reset;  // beta ~= 1: no leak
 {% else %}
-        data_t m = beta * (data_t)mem[i] + in[i] - reset[i];
+        data_t m = beta * (data_t)mem[i] + in[i] - reset;
 {% endif %}
 {% if use_fixed %}
         spike_t s = (m > v_th) ? (spike_t)1 : (spike_t)0;
         spk[i]   = s;
         out[i]   = s;
         mem[i]   = (lif_mem_t_{{ index }})m;
-        // reset = spike * v_th, but spike is 0/1 so a select avoids a multiply (a DSP when v_th is an arbitrary constant).
-        reset[i] = s ? v_th : (data_t)0;
 {% else %}
         data_t s = (m > v_th) ? ((data_t)1) : ((data_t)0);
         spk[i]   = s;
         out[i]   = s;
         mem[i]   = (lif_mem_t_{{ index }})m;
-        reset[i] = (s != (data_t)0) ? v_th : (data_t)0;
 {% endif %}
 {% endif %}
     }
