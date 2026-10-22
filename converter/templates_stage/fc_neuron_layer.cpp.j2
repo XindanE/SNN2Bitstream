@@ -1,0 +1,163 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+{#- A fully connected layer and the neuron layer after it, generated as one function for a streaming stage.
+    Weights, scales, types and the neuron update are the same as in fc_layer.cpp.j2 and neuron_layer.cpp.j2,
+    so the results are bit-identical.
+    Only the schedule changes: one pipeline instead of two loops, and spikes packed 32 per word. -#}
+{% set n_in = layer.prev_out_dim %}
+{% set n_out = layer.out_dim %}
+{% set nwi = (n_in + 31) // 32 %}
+{% set nwo = (n_out + 31) // 32 %}
+{% set p = [fc_out_parallel, n_out]|min %}
+{% set nch = (n_out + p - 1) // p %}
+// Fully connected layer {{ index }} merged with neuron layer {{ neuron.index }}
+#include "weights{{ layer.pair_idx }}.h"
+{% if layer.bias %}
+#include "biases{{ layer.pair_idx }}.h"
+{% endif %}
+#include <stddef.h>
+#include <stdint.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+typedef ap_fixed<{{ fixed_config.width }}, {{ fixed_config.int }}, AP_TRN, AP_SAT> data_t;
+typedef ap_uint<1> spike_t;
+typedef ap_int<{{ quant_weight.bit_width }}> w_t;
+typedef ap_fixed<{{ layer.scale_width|default(scale_config.width) }}, {{ layer.scale_int|default(scale_config.int) }}, AP_TRN, AP_SAT> scale_t;
+typedef ap_fixed<{{ layer.acc_width|default(fixed_config.width * 2) }}, {{ layer.acc_int|default(fixed_config.int * 2) }}, AP_TRN, AP_SAT> acc_t;
+typedef ap_uint<32> word_t;
+
+#define W{{ layer.pair_idx }}(o, i) weights{{ layer.pair_idx }}[o][i]
+
+// Index of the lowest set bit
+static inline int lowest_set_bit(word_t x) {
+#pragma HLS INLINE
+    int r = 0;
+    for (int b = 31; b >= 0; b--) {
+#pragma HLS UNROLL
+        if (x[b]) r = b;
+    }
+    return r;
+}
+
+void fc_neuron{{ index }}(
+    const word_t in_w[{{ nwi }}],
+    word_t out_w[{{ nwo }}],
+    data_t mem[{{ n_out }}],
+    spike_t spk[{{ n_out }}],
+    data_t beta,
+    data_t v_th
+) {
+#pragma HLS INLINE off
+{% if neuron.bit_shift_beta %}
+    (void)beta;
+{% endif %}
+    const scale_t weight_scale = ((scale_t)({{ quant_weight.scale }}));
+{% if quant_bias %}
+    // Bias dequant precomputed in Python double; see conv_layer for the precision rationale
+    const data_t bias_dequant_table[{{ n_out }}] = {
+{% for v in bias_dequant_table %}
+        ((data_t){{ "%.17g" | format(v) }}),
+{% endfor %}
+    };
+{% endif %}
+{% if p > 1 %}
+#pragma HLS ARRAY_PARTITION variable=weights{{ layer.pair_idx }} cyclic factor={{ p }} dim=1
+{% if quant_bias %}
+#pragma HLS ARRAY_PARTITION variable=bias_dequant_table cyclic factor={{ p }} dim=1
+{% endif %}
+{% endif %}
+
+    // Collect the active inputs, one per cycle.
+    ap_uint<{{ (n_in - 1).bit_length() if n_in > 1 else 1 }}> spike_idx[{{ n_in }}];
+    int nnz = 0;
+    FC{{ index }}_INDEX:
+    for (int w = 0; w < {{ nwi }}; w++) {
+        word_t x = in_w[w];
+        FC{{ index }}_SCAN:
+        for (int b = 0; b < 32; b++) {
+#pragma HLS PIPELINE II=1
+            if (x == 0) break;
+            spike_idx[nnz++] = w * 32 + lowest_set_bit(x);
+            x &= (word_t)(x - 1);
+        }
+    }
+
+    word_t ow[{{ nwo }}];
+#pragma HLS ARRAY_PARTITION variable=ow complete dim=1
+    for (int w = 0; w < {{ nwo }}; w++) {
+#pragma HLS UNROLL
+        ow[w] = 0;
+    }
+    acc_t acc[{{ p }}];
+#pragma HLS ARRAY_PARTITION variable=acc complete dim=1
+
+    // One pipeline walks every group of {{ p }} output(s) over every active input.
+    // When a group's sums are complete, its neurons are updated right away.
+    const int trips = nnz > 0 ? nnz : 1;
+    int s = 0, c = 0;
+    FC{{ index }}_MAC_NEURON:
+    for (int it = 0; it < {{ nch }} * trips; it++) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min={{ nch }} max={{ nch * n_in }} avg={{ (nch * n_in * 0.2)|int }}
+        // A membrane is written once per group, and neighbouring groups use different neurons.
+#pragma HLS DEPENDENCE variable=mem inter false
+#pragma HLS DEPENDENCE variable=spk inter false
+        const int idx = spike_idx[s];
+        for (int q = 0; q < {{ p }}; q++) {
+#pragma HLS UNROLL
+            const int o = c * {{ p }} + q;
+            acc_t v = (s == 0) ? (acc_t)0 : acc[q];
+            if (nnz > 0 && o < {{ n_out }}) v += (acc_t)W{{ layer.pair_idx }}(o, idx);
+            acc[q] = v;
+            if (s == trips - 1 && o < {{ n_out }}) {
+{% if quant_bias %}
+                data_t bias_dequant = bias_dequant_table[o];
+                data_t cur = (data_t)(v * weight_scale) + bias_dequant;
+{% else %}
+                data_t cur = (data_t)(v * weight_scale);
+{% endif %}
+{% if neuron.bit_shift_beta and neuron.beta_shift_k %}
+{% set leak = "((data_t)mem[o] - ((data_t)mem[o] >> " ~ neuron.beta_shift_k ~ "))" %}
+{% elif neuron.bit_shift_beta %}
+{% set leak = "(data_t)mem[o]" %}
+{% else %}
+{% set leak = "beta * (data_t)mem[o]" %}
+{% endif %}
+{% if neuron.reset_mechanism == 'zero' %}
+                data_t m = {{ leak }} + cur;
+                spike_t sp = (m > v_th) ? (spike_t)1 : (spike_t)0;
+                spk[o] = sp;
+                mem[o] = sp ? (data_t)0 : m;
+{% else %}
+                data_t reset = spk[o] ? v_th : (data_t)0;
+                data_t m = {{ leak }} + cur - reset;
+                spike_t sp = (m > v_th) ? (spike_t)1 : (spike_t)0;
+                spk[o] = sp;
+                mem[o] = m;
+{% endif %}
+                ow[o / 32][o % 32] = sp;
+            }
+        }
+        if (s == trips - 1) { s = 0; c++; } else { s++; }
+    }
+    for (int w = 0; w < {{ nwo }}; w++) {
+#pragma HLS UNROLL
+        out_w[w] = ow[w];
+    }
+}

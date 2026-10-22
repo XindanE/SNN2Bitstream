@@ -59,7 +59,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
                   backend="vitis", bambu_opt=None, bambu_extra=None,
                   fold_dequant=False, bit_shift_beta=False, input_is_binary=False,
                   data_width=None, data_int=None, mul_impl_fabric=False,
-                  sd_encoding=None):
+                  sd_encoding=None, fc_out_parallel=1):
     # Bambu emits float, plain C++: no ap_fixed, no HLS pragmas
     if backend == "bambu":
         use_fixed = False
@@ -444,6 +444,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
         if chosen > 0:
             print(f"[Info]   Conv layer OC={oc}: full OC unroll enabled (oc_factor={chosen})")
 
+    layer_ctxs = {}   # template context of each layer, reused by fused streaming stages
     for i, layer in enumerate(ir["layers"]):
         ltype = layer["type"]
 
@@ -589,6 +590,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
             "bit_shift_beta": bit_shift_beta,
             "beta_shift_k": _beta_to_shift(layer.get("beta", 0.9)) if ltype == "LIF" else None,
         }
+        layer_ctxs[i] = ctx
 
         match ltype:
             case "Linear":
@@ -799,6 +801,7 @@ def convert_model(ir_path, use_fixed=False, use_pragma=False,
             per_layer_lif_mem=per_layer_lif_mem,
             per_lif_mem_widths=per_lif_mem_widths,
             mul_impl_fabric=mul_impl_fabric,
+            layer_ctxs=layer_ctxs, stage_env=env, fc_out_parallel=fc_out_parallel,
         )
 
 
@@ -911,6 +914,9 @@ if __name__ == "__main__":
     parser.add_argument("--bit-shift-beta",   action="store_true",
                         help="Snap each beta to 1-2^-k and run the leak as mem-(mem>>k). Removes the "
                              "leak DSP; best when beta trains near a power of two.")
+    parser.add_argument("--fc-out-parallel",  type=int, default=1,
+                        help="Outputs updated per cycle in a fused streaming FC stage. Default 1. "
+                             "Larger is faster and uses more LUT and BRAM.")
     parser.add_argument("--mul-impl-fabric",  action="store_true",
                         help="Map multiplies to LUT fabric instead of DSP48. Only safe for "
                              "binary-input FCN; blows up LUT on conv, do NOT use for CSNN.")
@@ -999,4 +1005,5 @@ if __name__ == "__main__":
                   input_is_binary=args.input_is_binary,
                   data_width=args.data_width, data_int=args.data_int,
                   mul_impl_fabric=args.mul_impl_fabric,
-                  sd_encoding=args.sd_encoding)
+                  sd_encoding=args.sd_encoding,
+                  fc_out_parallel=args.fc_out_parallel)

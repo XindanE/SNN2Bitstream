@@ -19,7 +19,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 // PS sets DDR addresses for the FIRST and LAST stages and starts all stages; stages self-synchronize via AXI-Stream FIFOs.
 
 #include "xparameters.h"
-{% for sidx in range(num_stages) %}
+{% for sidx in range(num_stages) if not stage_free_running[sidx] %}
 #include "xstage{{ sidx }}.h"
 {% endfor %}
 #include "xil_printf.h"
@@ -124,6 +124,11 @@ static XUartPs Uart_Ps;
 
 static float sd_read_buf[ENCODED_SIZE] __attribute__((aligned(64)));
 static axi_input_t  input_buf[ENCODED_SIZE] __attribute__((aligned(64)));
+{% if packed_input %}
+// The fused first stage reads its binary input packed: input j of timestep t is bit j%32 of word t*PACKED_WORDS + j/32.
+#define PACKED_WORDS ((INPUT_DIM + 31) / 32)
+static u32 packed_buf[TIMESTEPS * PACKED_WORDS] __attribute__((aligned(64)));
+{% endif %}
 static axi_output_t output_buf[OUTPUT_SIZE] __attribute__((aligned(64)));
 static int labels[NUM_SAMPLES];
 
@@ -187,6 +192,18 @@ static inline axi_input_t float_to_fixed_input(float val) {
     return (axi_input_t)r;
 }
 #endif
+{% if packed_input %}
+
+// Pack one sample for the fused first stage.
+// A bit is set where the fixed-point input is non-zero, the same test an unfused first stage applies.
+static void pack_input(void) {
+    memset(packed_buf, 0, sizeof(packed_buf));
+    for (int t = 0; t < TIMESTEPS; t++)
+        for (int j = 0; j < INPUT_DIM; j++)
+            if (float_to_fixed_input(sd_read_buf[t * INPUT_DIM + j]) != 0)
+                packed_buf[t * PACKED_WORDS + j / 32] |= 1u << (j % 32);
+}
+{% endif %}
 
 // SD card
 
@@ -379,7 +396,7 @@ int main() {
     if (load_labels(SD_LABEL_FILE, labels, NUM_SAMPLES) != XST_SUCCESS) return XST_FAILURE;
 
     // Initialize all stage IPs
-{% for sidx in range(num_stages) %}
+{% for sidx in range(num_stages) if not stage_free_running[sidx] %}
     XStage{{ sidx }} stage{{ sidx }};
     if (XStage{{ sidx }}_Initialize(&stage{{ sidx }}, XPAR_STAGE{{ sidx }}_0_DEVICE_ID) != XST_SUCCESS) {
         xil_printf("[Error] Stage{{ sidx }} init failed!\r\n");
@@ -404,24 +421,32 @@ int main() {
     for (int i = START_SAMPLE; i < END_SAMPLE; i++) {
         if (load_sample(i) != XST_SUCCESS) continue;
 
+{% if packed_input %}
+        pack_input();
+{% else %}
 #if USE_FIXED
         for (int j = 0; j < ENCODED_SIZE; j++)
             input_buf[j] = float_to_fixed_input(sd_read_buf[j]);
 #else
         memcpy(input_buf, sd_read_buf, ENCODED_BYTES);
 #endif
+{% endif %}
         memset(output_buf, 0, sizeof(output_buf));
 
+{% if packed_input %}
+        Xil_DCacheFlushRange((UINTPTR)packed_buf, sizeof(packed_buf));
+{% else %}
         Xil_DCacheFlushRange((UINTPTR)input_buf,  ENCODED_SIZE * sizeof(axi_input_t));
+{% endif %}
         Xil_DCacheFlushRange((UINTPTR)output_buf,  OUTPUT_SIZE * sizeof(axi_output_t));
 
         // Set DDR addresses: FIRST reads input, LAST writes output
-        XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR)input_buf);
+        XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR){{ "packed_buf" if packed_input else "input_buf" }});
         XStage{{ num_stages - 1 }}_Set_ddr_output(&stage{{ num_stages - 1 }}, (u64)(UINTPTR)output_buf);
 
         // Start ALL stages,  self-synchronize via AXI-Stream
         XTime_GetTime(&t_start);
-{% for sidx in range(num_stages) %}
+{% for sidx in range(num_stages) if not stage_free_running[sidx] %}
         XStage{{ sidx }}_Start(&stage{{ sidx }});
 {% endfor %}
 
@@ -475,6 +500,11 @@ int main() {
     // for PL dynamic power. Reset the board to stop.
     xil_printf("\r\n==== Sustained-load power measurement (reset board to stop) ====\r\n");
     if (load_sample(0) == XST_SUCCESS) {
+{% if packed_input %}
+        pack_input();
+        Xil_DCacheFlushRange((UINTPTR)packed_buf, sizeof(packed_buf));
+        XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR)packed_buf);
+{% else %}
 #if USE_FIXED
         for (int j = 0; j < ENCODED_SIZE; j++) input_buf[j] = float_to_fixed_input(sd_read_buf[j]);
 #else
@@ -482,10 +512,11 @@ int main() {
 #endif
         Xil_DCacheFlushRange((UINTPTR)input_buf, ENCODED_SIZE * sizeof(axi_input_t));
         XStage0_Set_ddr_input(&stage0, (u64)(UINTPTR)input_buf);
+{% endif %}
         XStage{{ num_stages - 1 }}_Set_ddr_output(&stage{{ num_stages - 1 }}, (u64)(UINTPTR)output_buf);
     }
     for (u32 rep = 0; rep <= 10000u; rep++) {
-{% for sidx in range(num_stages) %}
+{% for sidx in range(num_stages) if not stage_free_running[sidx] %}
         XStage{{ sidx }}_Start(&stage{{ sidx }});
 {% endfor %}
         while (!XStage{{ num_stages - 1 }}_IsDone(&stage{{ num_stages - 1 }}));

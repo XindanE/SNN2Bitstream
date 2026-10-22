@@ -69,7 +69,8 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--data-width W` / `--data-int-width I` | Fixed-point type `ap_fixed<W,I>` (default 32-bit; `I` defaults to `W/2`). |
 | `--bit-shift-beta` | LIF leak as a bit shift instead of a multiply. |
 | `--mul-impl-fabric` | Multiplies on LUTs instead of DSPs (binary-input FC only). |
-| `--streaming` | Per-stage AXI-Stream design. |
+| `--streaming` | Per-stage AXI-Stream design (see below). |
+| `--fc-out-parallel N` | Streaming: outputs updated per cycle in a stage made of one FC and one LIF layer (default 1). Larger is faster and uses more LUT and BRAM. |
 | `--parallel-factor N` | FC unroll factor (default 8). |
 | `--pack-spikes` | Read all input spikes of a pixel as one word in conv layers (SPQ). |
 | `--conv-parallel-max N` | Largest IC×K×K per conv layer for `--unroll ic` (default 144). |
@@ -78,6 +79,10 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--input-shape C,H,W` | Input shape, required for Conv2d models on the custom route. |
 | `--input-is-binary` | Treat the input as binary spikes (custom route, rate-coded input only). |
 | `--csim-apfixed` / `--no-csim-apfixed` | GCC test with the real `ap_fixed` types (needs the Vitis HLS headers, slower). On by default for the config route, off for the custom route. |
+
+With `--streaming`, a stage made of one FC layer and one LIF layer (SPQ, sparse, spike input) runs both layers in one pipeline, and neighbouring stages of this kind pass 32 spikes per packet.
+If the input is binary, the first stage reads it packed 32 per word.
+If every stage is of this kind, the first and last stage connect straight to the PS HP ports and the middle stages run without a control port.
 
 ## Custom route
 

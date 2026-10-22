@@ -36,9 +36,18 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
                           acc_hls_type, acc_gcc_type, encoding,
                           per_layer_lif_mem=True,
                           per_lif_mem_widths=None,
-                          mul_impl_fabric=False):
+                          mul_impl_fabric=False,
+                          layer_ctxs=None, stage_env=None, fc_out_parallel=1):
     """Generate streaming code: C++ stages under output_dir/streaming/ (cpp/streaming/),
-    build TCL + host harness under the sibling xilinx/streaming/."""
+    build TCL + host harness under the sibling xilinx/streaming/.
+
+    Some stages are generated fused: the fully connected layer and its neuron layer become one pipeline
+    (fc_neuron_layer.cpp.j2, stage_top_fused.cpp.j2) that updates fc_out_parallel outputs per cycle.
+    See _fused_stage for when a stage qualifies.
+    Two neighbouring fused stages exchange 32 spikes per packet.
+    A fused middle stage has no control port.
+    A fused first stage reads its binary input packed 32 per word.
+    When every stage is fused, the first and last stage connect straight to HP0 and HP1 (no SmartConnect)."""
 
     streaming_dir = os.path.join(output_dir, "streaming")  # cpp/streaming/, C++ sources only
     os.makedirs(streaming_dir, exist_ok=True)
@@ -57,6 +66,10 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
     )
 
     num_stages = len(stages)
+    fused = [_fused_stage(st, layer_ctxs, use_fixed, use_pragma, encoding) if layer_ctxs else None
+             for st in stages]
+    is_fused = [f is not None for f in fused]
+    free_running = [is_fused[k] and 0 < k < num_stages - 1 for k in range(num_stages)]
 
     for stage in stages:
         stage_idx = stage["stage_idx"]
@@ -132,6 +145,9 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
                     files_to_copy.update([f"pool_layer{global_idx}.cpp", f"pool_layer{global_idx}.h"])
                     stage_layer_headers.append(f"pool_layer{global_idx}.h")
 
+        if is_fused[stage_idx]:
+            # The layer code comes from fc_neuron{idx}.cpp; keep only the weight and bias headers.
+            files_to_copy = {f for f in files_to_copy if f.startswith(("weights", "biases"))}
         for fname in files_to_copy:
             src = os.path.join(output_dir, fname)
             if os.path.isfile(src):
@@ -184,13 +200,24 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
             "acc_gcc_type":    acc_gcc_type,
         }
 
-        render_template(env_s, "stage_top.cpp.j2", ctx, stage_dir, f"stage{stage_idx}_top.cpp")
+        if is_fused[stage_idx]:
+            fc_idx, neuron = fused[stage_idx]
+            fc_ctx = dict(layer_ctxs[fc_idx], neuron=neuron, fc_out_parallel=fc_out_parallel)
+            render_template(stage_env, "fc_neuron_layer.cpp.j2", fc_ctx, stage_dir, f"fc_neuron{fc_idx}.cpp")
+            ctx.update(fc_index=fc_idx, fc_out_parallel=fc_out_parallel, free_running=free_running[stage_idx],
+                       packed_input=is_first,
+                       in_packed=(not is_first) and is_fused[stage_idx - 1],
+                       out_packed=(not is_last) and is_fused[stage_idx + 1])
+            render_template(env_s, "stage_top_fused.cpp.j2", ctx, stage_dir, f"stage{stage_idx}_top.cpp")
+        else:
+            render_template(env_s, "stage_top.cpp.j2", ctx, stage_dir, f"stage{stage_idx}_top.cpp")
         render_template(env_s, "stage_top.h.j2",   ctx, stage_dir, f"stage{stage_idx}_top.h")
         render_template(env_s, "run_hls_stage.tcl.j2", ctx, xilinx_stage_dir, "run_hls_stage.tcl")
 
         role = "FIRST" if is_first else ("LAST" if is_last else "MID")
         print(f"[STREAMING] Stage {stage_idx} ({role}): {stage['description']}  "
-              f"(in={in_dim}, out={out_dim}, files={len(files_to_copy)})")
+              f"(in={in_dim}, out={out_dim}, files={len(files_to_copy)})"
+              + (f"  fused, {fc_out_parallel} output(s)/cycle" if is_fused[stage_idx] else ""))
 
     # Vivado axis_data_fifo accepts a power of two from 16 to 32768
     AXIS_FIFO_DEPTH_MIN = 16
@@ -220,6 +247,9 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
         "num_stages":    num_stages,
         "fifo_depths":   fifo_depths,
         "stage_has_gmem": stage_has_gmem,
+        "stage_free_running": free_running,
+        "direct_hp_ports": all(is_fused),
+        "packed_input":  is_fused[0],
     }
     render_template(env_s, "vivado_streaming_zcu104.tcl.j2", vivado_ctx,
                     xilinx_streaming_dir, "vivado_streaming_zcu104.tcl")
@@ -232,3 +262,36 @@ def emit_streaming_stages(output_dir, stages, ir, ir_path,
     print(f"[STREAMING] Build scripts in {xilinx_streaming_dir}")
     print(f"[STREAMING] Vivado Tcl:  {xilinx_streaming_dir}/vivado_streaming_zcu104.tcl")
     print(f"[STREAMING] Vitis Tcl:   {xilinx_streaming_dir}/run_vitis_streaming.tcl")
+
+
+def _fused_stage(stage, layer_ctxs, use_fixed, use_pragma, encoding):
+    """Return (fc layer index, neuron info) if the stage can be fused, else None.
+
+    A stage qualifies when it is exactly one Linear layer followed by one LIF layer and:
+      - the build is fixed point with pragmas;
+      - its input is spikes, the FC layer is sparse with quantized weights;
+      - the weights are not split and the dequant is not folded;
+      - the membrane uses the full data width.
+    A first stage with the repeat encoding does not qualify.
+    """
+    layers = stage["all_layers"]
+    if not (use_fixed and use_pragma) or [l["type"] for l in layers] != ["Linear", "LIF"]:
+        return None
+    if not stage.get("input_is_spike", False) or stage.get("input_is_narrow_data", False):
+        return None
+    if stage["stage_idx"] == 0 and encoding == "repeat":
+        return None   # repeat keeps a single frame, the packed reader expects one per timestep
+    fc_idx, lif_idx = layers[0]["global_idx"], layers[1]["global_idx"]
+    fc, lif = layer_ctxs.get(fc_idx), layer_ctxs.get(lif_idx)
+    if fc is None or lif is None:
+        return None
+    if not (fc["use_sparse"] and fc["input_is_spike"] and fc["quant_weight"]) or fc["fold_dequant"]:
+        return None
+    if fc["layer"].get("_weight_split_chunks", 0) > 1 or lif["layer"].get("lif_mem_narrow", False):
+        return None
+    return fc_idx, {
+        "index": lif_idx,
+        "reset_mechanism": lif["layer"].get("reset_mechanism", "subtract"),
+        "bit_shift_beta": lif["bit_shift_beta"],
+        "beta_shift_k": lif["beta_shift_k"],
+    }

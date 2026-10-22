@@ -85,7 +85,16 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
     [get_bd_cells $ps_name]
 set_property -dict [list \
     CONFIG.SUBPRESET1            {DDR4_MICRON_MT40A256M16GE_083E} \
+{% if direct_hp_ports %}
+    CONFIG.PSU__USE__S_AXI_GP0   {0} \
+    CONFIG.PSU__USE__S_AXI_GP2   {1} \
+    CONFIG.PSU__USE__S_AXI_GP3   {1} \
+    CONFIG.PSU__SAXIGP2__DATA_WIDTH {32} \
+    CONFIG.PSU__SAXIGP3__DATA_WIDTH {32} \
+    CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
+{% else %}
     CONFIG.PSU__USE__S_AXI_GP0   {1} \
+{% endif %}
 ] [get_bd_cells $ps_name]
 
 # 3.2 AXI GPIO (LEDs; IP version resolved from catalog)
@@ -132,7 +141,7 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
 } [get_bd_intf_pins axi_gpio_0/S_AXI]
 
 # 4.3 Stage control ports (AXI-Lite from PS)
-{% for sidx in range(num_stages) %}
+{% for sidx in range(num_stages) if not stage_free_running[sidx] %}
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
     Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
     Master {/zynq_ultra_ps_e_0/M_AXI_HPM0_FPD} \
@@ -142,6 +151,14 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
 {% endfor %}
 
 # 4.4 Stage DDR access (m_axi_gmem -> PS S_AXI_HPC0_FPD)
+{% if direct_hp_ports %}
+# First and last stage go straight to their own 32-bit HP port, with no SmartConnect.
+# HP ports are not cache coherent; the board program flushes and invalidates around each inference.
+connect_bd_intf_net [get_bd_intf_pins stage0_0/m_axi_gmem] [get_bd_intf_pins $ps_name/S_AXI_HP0_FPD]
+connect_bd_intf_net [get_bd_intf_pins stage{{ num_stages - 1 }}_0/m_axi_gmem] [get_bd_intf_pins $ps_name/S_AXI_HP1_FPD]
+connect_bd_net [get_bd_pins $ps_name/pl_clk0] [get_bd_pins $ps_name/saxihp0_fpd_aclk]
+connect_bd_net [get_bd_pins $ps_name/pl_clk0] [get_bd_pins $ps_name/saxihp1_fpd_aclk]
+{% else %}
 {% for sidx in range(num_stages) %}
 {% if stage_has_gmem[sidx] %}
 {% if sidx == 0 %}
@@ -163,6 +180,7 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config { \
 {% endif %}
 {% endif %}
 {% endfor %}
+{% endif %}
 
 # 4.5 AXI-Stream: stage -> FIFO -> stage
 {% for fidx in range(num_stages - 1) %}
@@ -175,9 +193,15 @@ connect_bd_intf_net \
 {% endfor %}
 
 # 4.6 Clock and reset for FIFOs
+# FIFOs and free-running stages use the proc_sys_reset output, which is synchronous to pl_clk0.
+set sync_rstn [get_bd_pins -of_objects [get_bd_cells -filter {VLNV =~ "*proc_sys_reset*"}] -filter {NAME == peripheral_aresetn}]
 {% for fidx in range(num_stages - 1) %}
 connect_bd_net [get_bd_pins $ps_name/pl_clk0]    [get_bd_pins fifo_{{ fidx }}_{{ fidx + 1 }}/s_axis_aclk]
-connect_bd_net [get_bd_pins $ps_name/pl_resetn0]  [get_bd_pins fifo_{{ fidx }}_{{ fidx + 1 }}/s_axis_aresetn]
+connect_bd_net [get_bd_pins $sync_rstn] [get_bd_pins fifo_{{ fidx }}_{{ fidx + 1 }}/s_axis_aresetn]
+{% endfor %}
+{% for sidx in range(num_stages) if stage_free_running[sidx] %}
+connect_bd_net [get_bd_pins $ps_name/pl_clk0] [get_bd_pins stage{{ sidx }}_0/ap_clk]
+connect_bd_net [get_bd_pins $sync_rstn] [get_bd_pins stage{{ sidx }}_0/ap_rst_n]
 {% endfor %}
 
 # 4.7 Clock and reset for stage IPs (if not already connected)
@@ -198,6 +222,9 @@ if {[llength [get_bd_pins $ps_name/maxihpm1_fpd_aclk]]} {
     }
 }
 
+{% if direct_hp_ports %}
+assign_bd_address
+{% endif %}
 regenerate_bd_layout
 
 # Step 5: Validate and save

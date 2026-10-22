@@ -1,0 +1,159 @@
+{#
+This file is part of SNN2Bitstream.
+Copyright (C) 2026 Xindan Zhang, Sorbonne Université, CNRS, LIP6
+
+SNN2Bitstream is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SNN2Bitstream is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-#}
+{#- Top of a streaming stage made of one fully connected layer and one neuron layer (fc_neuron_layer.cpp.j2).
+    Between two such stages a packet carries 32 spikes; next to any other stage it carries one, as in stage_top.cpp.j2.
+    As the first stage, it reads its binary input from DDR packed 32 per word. -#}
+{% set nwi = (in_dim + 31) // 32 %}
+{% set nwo = (out_dim + 31) // 32 %}
+// Streaming stage {{ stage_idx }}: {{ description }}. Auto-generated; DO NOT EDIT.
+#include "stage{{ stage_idx }}_top.h"
+#include <ap_int.h>
+#include <stddef.h>
+
+typedef ap_uint<32> word_t;
+void fc_neuron{{ fc_index }}(const word_t in_w[{{ nwi }}], word_t out_w[{{ nwo }}], data_t mem[{{ out_dim }}],
+                spike_t spk[{{ out_dim }}], data_t beta, data_t v_th);
+
+// Stage {{ stage_idx }} ({{ "FIRST" if is_first_stage else ("LAST" if is_last_stage else "MIDDLE") }})
+void stage{{ stage_idx }}(
+{% if is_first_stage %}
+    const input_word_t *ddr_input,
+    hls::stream<stream_pkt_t> &out_stream
+{% elif is_last_stage %}
+    hls::stream<stream_pkt_t> &in_stream,
+    output_t *ddr_output
+{% else %}
+    hls::stream<stream_pkt_t> &in_stream,
+    hls::stream<stream_pkt_t> &out_stream
+{% endif %}
+) {
+{% if is_first_stage %}
+#pragma HLS INTERFACE m_axi port=ddr_input offset=slave depth={{ timesteps * nwi }} bundle=gmem
+#pragma HLS INTERFACE axis port=out_stream
+#pragma HLS INTERFACE s_axilite port=ddr_input bundle=control
+#pragma HLS INTERFACE s_axilite port=return    bundle=control
+{% elif is_last_stage %}
+#pragma HLS INTERFACE axis port=in_stream
+#pragma HLS INTERFACE m_axi port=ddr_output offset=slave depth={{ out_dim }} bundle=gmem
+#pragma HLS INTERFACE s_axilite port=ddr_output bundle=control
+#pragma HLS INTERFACE s_axilite port=return     bundle=control
+{% else %}
+#pragma HLS INTERFACE axis port=in_stream
+#pragma HLS INTERFACE axis port=out_stream
+{% if free_running %}
+// No control port: the stage restarts on its own and waits on its streams.
+#pragma HLS INTERFACE ap_ctrl_none port=return
+{% else %}
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+{% endif %}
+{% endif %}
+
+    // LIF parameters
+    static const data_t BETA = ((data_t){{ lif_beta }});
+    static const data_t VTH  = ((data_t){{ lif_vth }});
+
+    // LIF state is static so it persists across HLS calls for multi-inference.
+    static data_t mem[{{ out_dim }}];
+    static spike_t spk[{{ out_dim }}];
+{% if fc_out_parallel > 1 %}
+#pragma HLS ARRAY_PARTITION variable=mem cyclic factor={{ [fc_out_parallel, out_dim]|min }} dim=1
+#pragma HLS ARRAY_PARTITION variable=spk cyclic factor={{ [fc_out_parallel, out_dim]|min }} dim=1
+{% endif %}
+    INIT_STATE: for (int i = 0; i < {{ out_dim }}; i++) {
+#pragma HLS PIPELINE II=1
+        mem[i] = (data_t)0;
+        spk[i] = (spike_t)0;
+    }
+{% if is_last_stage %}
+
+    // Output accumulator (spike count over time)
+    spike_acc_t acc[{{ out_dim }}];
+#pragma HLS ARRAY_PARTITION variable=acc complete dim=1
+    INIT_ACC: for (int i = 0; i < {{ out_dim }}; i++) {
+#pragma HLS UNROLL
+        acc[i] = (spike_acc_t)0;
+    }
+{% endif %}
+
+    TIMESTEP_LOOP: for (int t = 0; t < TIMESTEPS; t++) {
+#pragma HLS LOOP_TRIPCOUNT min={{ timesteps }} max={{ timesteps }}
+        word_t in_w[{{ nwi }}];
+#pragma HLS ARRAY_PARTITION variable=in_w complete dim=1
+{% if is_first_stage %}
+        // Input i of timestep t is bit i%32 of word t*{{ nwi }} + i/32.
+        READ_FRAME: for (int w = 0; w < {{ nwi }}; w++) {
+#pragma HLS PIPELINE II=1
+            in_w[w] = ddr_input[(size_t)t * {{ nwi }} + w];
+        }
+{% elif in_packed %}
+        READ_STREAM: for (int w = 0; w < {{ nwi }}; w++) {
+#pragma HLS PIPELINE II=1
+            in_w[w] = in_stream.read().data;
+        }
+{% else %}
+        for (int w = 0; w < {{ nwi }}; w++) {
+#pragma HLS UNROLL
+            in_w[w] = 0;
+        }
+        READ_STREAM: for (int i = 0; i < {{ in_dim }}; i++) {
+#pragma HLS PIPELINE II=1
+            in_w[i / 32][i % 32] = (ap_uint<1>)in_stream.read().data[0];
+        }
+{% endif %}
+
+        word_t out_w[{{ nwo }}];
+#pragma HLS ARRAY_PARTITION variable=out_w complete dim=1
+        fc_neuron{{ fc_index }}(in_w, out_w, mem, spk, BETA, VTH);
+
+{% if is_last_stage %}
+        ACCUMULATE: for (int i = 0; i < {{ out_dim }}; i++) {
+#pragma HLS UNROLL
+            acc[i] += (spike_acc_t)out_w[i / 32][i % 32];
+        }
+{% elif out_packed %}
+        WRITE_STREAM: for (int w = 0; w < {{ nwo }}; w++) {
+#pragma HLS PIPELINE II=1
+            stream_pkt_t pkt;
+            pkt.data = out_w[w];
+            pkt.keep = -1;
+            pkt.strb = -1;
+            pkt.last = (w == {{ nwo }} - 1);
+            out_stream.write(pkt);
+        }
+{% else %}
+        WRITE_STREAM: for (int i = 0; i < {{ out_dim }}; i++) {
+#pragma HLS PIPELINE II=1
+            stream_pkt_t pkt;
+            pkt.data = (ap_uint<32>)out_w[i / 32][i % 32];
+            pkt.keep = -1;
+            pkt.strb = -1;
+            pkt.last = (i == {{ out_dim }} - 1);
+            out_stream.write(pkt);
+        }
+{% endif %}
+    }
+{% if is_last_stage %}
+
+    // Divide by 2^{{ output_shift }} with a shift instead of by TIMESTEPS.
+    // 2^{{ output_shift }} >= TIMESTEPS keeps the result in [0,1], and argmax does not depend on the scale.
+    WRITE_OUTPUT: for (int i = 0; i < {{ out_dim }}; i++) {
+#pragma HLS PIPELINE II=1
+        ddr_output[i] = (output_t)(((data_t)acc[i]) >> {{ output_shift }});
+    }
+{% endif %}
+}

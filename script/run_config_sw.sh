@@ -51,6 +51,7 @@ SPARSE_FLAG=""         # Sparse spike-driven computation
 FOLD_FLAG=""           # Fold dequant scale into LIF threshold (drops dequant multiply)
 BSHIFT_FLAG=""         # Bit-shift LIF leak (mem-(mem>>k) instead of beta multiply)
 MUL_FABRIC_FLAG=""     # Map multiplies to LUT fabric instead of DSP48 (binary-input FCN only)
+FC_OUT_PARALLEL_FLAG="" # --fc-out-parallel: outputs per cycle in fused streaming FC stages (default 1)
 SD_ENC_FLAG=""         # SD test-data encoding label for SD_DATA_DIR (count/spike/rate/repeat)
 USER_PROJECT=""        # Project name override for A/B experiments
 QUANT_BITS=""          # Quantization bit width (default: 8)
@@ -125,6 +126,10 @@ while [ "$#" -gt 0 ]; do
         --mul-impl-fabric)
             MUL_FABRIC_FLAG="--mul-impl-fabric"
             shift
+            ;;
+        --fc-out-parallel)
+            FC_OUT_PARALLEL_FLAG="--fc-out-parallel $2"
+            shift 2
             ;;
         --sd-encoding)
             SD_ENC_FLAG="--sd-encoding $2"
@@ -287,6 +292,8 @@ print("TOML_CONFIG=" + str(g("config", "")))
 print("TOML_SPARSE=" + str(g("sparse", "")).lower())
 print("TOML_FOLD=" + str(g("fold_dequant", "")).lower())
 print("TOML_BSHIFT=" + str(g("bit_shift_beta", "")).lower())
+print("TOML_MUL_FABRIC=" + str(g("mul_impl_fabric", "")).lower())
+print("TOML_FC_OUT_PARALLEL=" + str(g("fc_out_parallel", "")))
 print("TOML_QUANT=" + str(g("quant", "")))
 print("TOML_QUANT_BITS=" + str(g("quant_bits", "")))
 unroll_val = g("unroll", "")
@@ -321,6 +328,7 @@ PYEOF
 ) || {
     echo "[Warn] failed to read [codegen] from TOML (section may not exist)"
     TOML_CONFIG="" TOML_SPARSE="" TOML_FOLD="" TOML_BSHIFT="" TOML_QUANT="" TOML_QUANT_BITS=""
+    TOML_MUL_FABRIC="" TOML_FC_OUT_PARALLEL=""
     TOML_UNROLL="" TOML_DATAFLOW="" TOML_CHECKPOINT="" TOML_PARALLEL_FACTOR="" TOML_STREAMING=""
     TOML_CONV_OC_FACTOR="" TOML_CONV_OC_MAX="" TOML_DATA_WIDTH="" TOML_PACK_SPIKES="" TOML_CONV_PARALLEL_MAX=""
     TOML_BACKEND="" TOML_BAMBU_OPT="" TOML_BAMBU_EXTRA=""
@@ -339,6 +347,12 @@ if [[ "$TOML_FOLD" == "true" && -z "$FOLD_FLAG" ]]; then
 fi
 if [[ "$TOML_BSHIFT" == "true" && -z "$BSHIFT_FLAG" ]]; then
     BSHIFT_FLAG="--bit-shift-beta"
+fi
+if [[ "$TOML_MUL_FABRIC" == "true" && -z "$MUL_FABRIC_FLAG" ]]; then
+    MUL_FABRIC_FLAG="--mul-impl-fabric"
+fi
+if [[ -n "$TOML_FC_OUT_PARALLEL" && -z "$FC_OUT_PARALLEL_FLAG" ]]; then
+    FC_OUT_PARALLEL_FLAG="--fc-out-parallel $TOML_FC_OUT_PARALLEL"
 fi
 if [[ -n "$TOML_SD_ENCODING" && -z "$SD_ENC_FLAG" ]]; then
     SD_ENC_FLAG="--sd-encoding $TOML_SD_ENCODING"
@@ -627,7 +641,7 @@ esac
 
 run_logged python3 converter/converter.py "$IR_DIR/ir.json" --config "$CONFIG" \
     $PARALLEL_FACTOR $UNROLL_FLAG $PACK_SPIKES_FLAG $CONV_PARALLEL_MAX_FLAG $DATAFLOW_FLAG $SPARSE_FLAG $FOLD_FLAG $BSHIFT_FLAG \
-    $MUL_FABRIC_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
+    $MUL_FABRIC_FLAG $FC_OUT_PARALLEL_FLAG $SD_ENC_FLAG $CONVERTER_PROJECT_ARG $STREAMING_FLAG \
     $CONV_OC_FACTOR_FLAG $CONV_OC_MAX_FLAG $DATA_WIDTH_FLAG $DATA_INT_FLAG \
     $BACKEND_ARG $BAMBU_OPT_ARG ${BAMBU_EXTRA_ARG:+"$BAMBU_EXTRA_ARG"}
 

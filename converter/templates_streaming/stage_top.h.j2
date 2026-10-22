@@ -37,6 +37,9 @@ typedef ap_uint<1> spike_t;
 typedef {{ input_hls_type }} input_t;
 typedef {{ output_hls_type }} output_t;
 typedef {{ acc_hls_type }} spike_acc_t;
+{% if packed_input|default(false) %}
+typedef ap_uint<32> input_word_t;  // binary input packed 32 per word
+{% endif %}
 #else
 #include <stdint.h>
 typedef float data_t;
@@ -44,6 +47,9 @@ typedef uint8_t spike_t;
 typedef {{ input_gcc_type }} input_t;
 typedef {{ output_gcc_type }} output_t;
 typedef {{ acc_gcc_type }} spike_acc_t;
+{% if packed_input|default(false) %}
+typedef uint32_t input_word_t;
+{% endif %}
 #endif
 {% else %}
 typedef float data_t;
@@ -80,7 +86,7 @@ public:
 // Function declaration
 {% if is_first_stage %}
 void stage{{ stage_idx }}(
-    const input_t *ddr_input,
+    const {{ "input_word_t" if packed_input|default(false) else "input_t" }} *ddr_input,
     hls::stream<stream_pkt_t> &out_stream
 );
 {% elif is_last_stage %}
