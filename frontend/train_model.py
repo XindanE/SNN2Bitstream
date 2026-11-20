@@ -32,6 +32,8 @@ from frontend.standardize_model import standardize_state_dict as _standardize_sd
 from frontend.datasets import (default_encoding as _ds_default_encoding,
                                module_name as _ds_module_name)
 
+MSE_RATES = (1.0, 0.0)
+
 
 def get_loaders(dataset_cfg, batch_size, timesteps, encoding="repeat"):
     dataset_name = _ds_module_name(dataset_cfg["kind"])
@@ -154,7 +156,7 @@ def evaluate(model, kind, loader, device, timesteps, encoding="repeat", loss_typ
     if use_mem_loss:
         criterion = None
     elif loss_type == "mse_count":
-        criterion = SF.mse_count_loss()
+        criterion = SF.mse_count_loss(correct_rate=MSE_RATES[0], incorrect_rate=MSE_RATES[1])
     else:
         criterion = SF.ce_count_loss()
 
@@ -198,7 +200,7 @@ def train_with_history(model, kind, loader, optimizer, device,
         criterion = None
         print("[Info] Using membrane potential CE loss (per-timestep)")
     elif loss_type == "mse_count":
-        criterion = SF.mse_count_loss()
+        criterion = SF.mse_count_loss(correct_rate=MSE_RATES[0], incorrect_rate=MSE_RATES[1])
         print("[Info] Using MSE count loss")
     else:
         criterion = SF.ce_count_loss()
@@ -420,6 +422,10 @@ def main(config_path, use_qat=False, pretrained_path=None):
     scheduler_per_epoch = scheduler_kind in ("cosine",)
 
     loss_type = training.get("loss", "ce_count")
+    global MSE_RATES
+    MSE_RATES = (float(training.get("mse_correct_rate", 1.0)), float(training.get("mse_incorrect_rate", 0.0)))
+    if loss_type == "mse_count":
+        print(f"[Info] mse_count rates: correct={MSE_RATES[0]}, incorrect={MSE_RATES[1]}")
     label_smoothing = float(training.get("label_smoothing", 0.0))
 
     training_history, best_state_dict = train_with_history(

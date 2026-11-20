@@ -1,0 +1,49 @@
+[project]
+name = "cifar10dvs_csnn"
+
+[dataset]
+kind = "cifar10dvs"
+path = "data"
+target_h = 48
+target_w = 48
+seed = 42
+train_ratio = 0.9
+augment = true
+
+[model_template]
+kind = "CSNN"
+params.conv_channels = [16, 32, 64]
+params.kernel_sizes = [3, 3, 3]
+params.paddings = [1, 1, 1]
+params.pool_sizes = [2, 2, 2]
+params.pool_types = ["max", "max", "max"]
+params.fc_units = [128]
+params.timesteps = 16
+params.neuron = "plif"
+params.init_tau = 2.0
+params.threshold = 1.0
+params.use_bn = true
+params.dropout = 0.5
+params.pool_before_lif = true
+
+[optimizer]
+kind = "sgd"
+lr = 0.1
+momentum = 0.9
+weight_decay = 0.0005
+
+[training]
+epochs = 200
+batch_size = 32
+loss = "mse_count"
+mse_correct_rate = 0.7
+mse_incorrect_rate = 0.2
+grad_clip = 1.0
+scheduler = "onecycle"
+
+[codegen]
+config = "SPQ"
+sparse = true
+quant = "qat_ft"
+qat_ft_epochs = 20
+data_width = 16

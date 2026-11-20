@@ -1,0 +1,35 @@
+[project]
+name = "nmnist_csnn"
+
+[dataset]
+kind = "nmnist"
+path = "data"
+time_window_us = 30000     # 30 ms per frame, 10 steps for a 300 ms recording
+denoise_us = 10000
+
+[model_template]
+kind = "CSNN"
+params.conv_channels = [16, 32]
+params.kernel_sizes = [5, 3]
+params.pool_sizes = [2, 2]
+params.pool_types = ["avg", "max"]
+params.fc_units = [128]
+params.beta = 0.9
+params.timesteps = 10
+
+[optimizer]
+kind = "Adam"
+lr = 0.001
+weight_decay = 0.0001
+
+[training]
+epochs = 15
+batch_size = 128
+
+[codegen]
+config = "SPQ"
+sparse = true
+quant = "qat_ft"
+data_width = 16            # data_t = ap_fixed<16,8> instead of the default 32-bit upgrade
+unroll = ["ic"]            # unroll conv kernel loops and input channels
+pack_spikes = true         # pack the 1-bit spike inputs of a conv layer into one word per pixel
