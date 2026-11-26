@@ -52,6 +52,11 @@
 #define START_SAMPLE        0
 #define END_SAMPLE          NUM_SAMPLES
 
+// 1: print one line per sample; 0: print only the cumulative accuracy and the result. Can be set in model.h.
+#ifndef PRINT_EACH_SAMPLE
+#define PRINT_EACH_SAMPLE   1
+#endif
+
 // COUNTS_PER_SECOND defined by xtime_l.h (= XPAR_CPU_CORTEXA53_0_TIMESTAMP_CLK_FREQ)
 
 // Float mode defaults: model.h only defines these macros in fixed-point (SQ/SPQ) configs
@@ -453,9 +458,11 @@ int main() {
 
         //show_class_on_led(pred);
 
+#if PRINT_EACH_SAMPLE
         // Per-sample line: just whether this sample was correct.
         xil_printf("[%d] predict=%d label=%d %s\r\n",
                    i, pred, label, (pred == label) ? "CORRECT" : "WRONG");
+#endif
 
         // ~10 cumulative-accuracy checkpoints interspersed across the run.
         if (tested % print_every == 0) {
