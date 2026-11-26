@@ -79,6 +79,7 @@ All options can be given on the command line or in the TOML `[codegen]` section 
 | `--input-shape C,H,W` | Input shape, required for Conv2d models on the custom route. |
 | `--input-is-binary` | Treat the input as binary spikes (custom route, rate-coded input only). |
 | `--csim-apfixed` / `--no-csim-apfixed` | GCC test with the real `ap_fixed` types (needs the Vitis HLS headers, slower). On by default for the config route, off for the custom route. |
+| `--max-samples N` | GCC test on N random test samples only (config route, command line). |
 
 With `--streaming`, a stage made of one FC layer and one LIF layer (SPQ, sparse, spike input) runs both layers in one pipeline, and neighbouring stages of this kind pass 32 spikes per packet.
 If the input is binary, the first stage reads it packed 32 per word.
